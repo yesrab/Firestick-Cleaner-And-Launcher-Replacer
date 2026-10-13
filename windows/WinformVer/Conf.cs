@@ -50,6 +50,8 @@ namespace FirestickCleanup
         public string NotificationListener => Get("notification_listener");
         public string Source => Get("source");
         public string FallbackUrl => Get("fallback_url");
+        public string Page => Get("page");
+        public string AssetMatch => Get("asset_match");
         public bool IsLauncher => Type == "launcher";
         public bool IsAddon => Type == "addon";
         public string Prompt => Get("prompt");
@@ -57,6 +59,8 @@ namespace FirestickCleanup
         public IEnumerable<string> Needs => Get("needs").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
         public IEnumerable<string> Disables => Get("disables").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
         public IEnumerable<string> Grants => Get("grant").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        public IEnumerable<string> AppOps => Get("appops").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        public bool StartsAtBoot => Get("boot") == "yes";
         public IEnumerable<string> ApkGlobs => Get("apk_glob").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
         public List<string> Notes => GetAll("note");
 

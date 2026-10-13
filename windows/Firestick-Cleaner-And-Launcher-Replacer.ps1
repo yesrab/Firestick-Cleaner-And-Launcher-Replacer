@@ -20,6 +20,17 @@ $LaunchersConf = Join-Path $CommonDir 'launchers.conf'
 $DownloadDir   = Join-Path $PlatformDir 'downloads'
 $LastIpFile    = Join-Path $PlatformDir '.last_ip'
 $DeviceTmp     = '/data/local/tmp'
+# Folder your browser saves downloads to (override with the FSC_DOWNLOADS_DIR environment variable).
+$DownloadsWatch = $env:FSC_DOWNLOADS_DIR
+if (-not $DownloadsWatch) {
+    try { $DownloadsWatch = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders' -ErrorAction Stop).'{374DE290-123F-4565-9164-39C4925E467B}' } catch { }
+    if (-not $DownloadsWatch) { $DownloadsWatch = Join-Path $env:USERPROFILE 'Downloads' }
+}
+# APKMirror serves app metadata (versions, variants, signing certs) to the open-source APKUpdater
+# app through this endpoint; the key ships inside that app. APKMirror does not allow scripted
+# file downloads, so the download itself happens in your browser.
+$ApkMirrorApi  = 'https://www.apkmirror.com/wp-json/apkm/v1/app_exists/'
+$ApkMirrorAuth = 'Basic YXBpLWFwa3VwZGF0ZXI6cm01cmNmcnVVakt5MDRzTXB5TVBKWFc4'
 $LogFile       = Join-Path $PlatformDir ('firestick_cleanup_{0:yyyyMMdd_HHmmss}.log' -f (Get-Date))
 $EntryName     = 'Firestick-Cleaner-And-Launcher-Replacer.bat'
 
@@ -28,6 +39,8 @@ $AddonsWith = @(); $AddonsWithout = @(); $ChosenAddons = ''
 $DisableGroups = ''; $NonInteractive = $false; $ADB = ''; $Target = ''; $StateFile = ''
 $State = New-Object System.Collections.ArrayList
 $TotalDisabled = 0; $TotalProtected = 0; $Passes = 0; $Reapplied = 0
+$Dev = @{ Sdk = 0; Abis = ''; Release = ''; FireOs = ''; Model = '' }
+$ExpectedVCode = ''
 
 # ------------------------------------------------------------
 # CLI
@@ -43,11 +56,12 @@ Modes (default: full install)
   --reapply           Re-disable packages using the saved choices (after a Fire OS update)
   --status            Show launcher, Home on Fire and disabled-package state; change nothing
   --dry-run           Show what would be done; change nothing
+  --test-boot         Reboot the Fire TV and check the launcher and add-ons come up
 
 Options
   --ip <ip[:port]>    Fire TV address (skips the prompt)
   --launcher <key>    projectivy | at4k | couchy   (default: projectivy)
-  --with <a,b,..>     Add-ons to install: homeonfire, youtubetv (see common\launchers.conf)
+  --with <a,b,..>     Add-ons: homeonfire, youtubetv, googleapp, smarttube (see common\launchers.conf)
   --without <a,b,..>  Add-ons to skip
   --home-on-fire      Same as --with homeonfire      --no-home-on-fire: --without homeonfire
   --disable <a,b,..>  Optional groups to disable, comma-separated (see common\packages.conf)
@@ -72,6 +86,7 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
         '^(--|-|/)reapply$'         { $Mode = 'reapply'; break }
         '^(--|-|/)status$'          { $Mode = 'status'; break }
         '^(--|-|/)dry-?run$'        { $Mode = 'dry-run'; break }
+        '^(--|-|/)test-?boot$'      { $Mode = 'test-boot'; break }
         '^(--|-|/)ip$'              { $i++; $FireIp = [string]$argv[$i]; break }
         '^(--|-|/)ip=(.+)$'         { $FireIp = $Matches[2]; break }
         '^(--|-|/)launcher$'        { $i++; $LauncherKey = [string]$argv[$i]; break }
@@ -291,11 +306,46 @@ function Connect-Device {
 }
 
 function Restart-Device {
+    # The package manager persists package state asynchronously; rebooting straight after
+    # a batch of pm commands loses the last few changes.
+    Info 'Letting the Fire TV save its package state...'
+    Start-Sleep -Seconds 15
+    # Best effort: ask Fire OS to keep ADB debugging enabled across the reboot.
+    Invoke-Dsh @('settings', 'put', 'global', 'adb_enabled', '1') | Out-Null
+    Invoke-Dsh @('settings', 'put', 'global', 'adb_wifi_enabled', '1') | Out-Null
     Info 'Rebooting Fire TV...'
     Invoke-Dsh @('reboot') | Out-Null
     Start-Sleep -Seconds 20
     if (Wait-ForDevice 180) { Start-Sleep -Seconds 5; Ok 'Device is back online'; return $true }
-    return $false
+    # Some Fire OS builds switch ADB debugging off at boot; let the user turn it back on.
+    while ($true) {
+        Warn 'The Fire TV did not come back on ADB. Fire OS can switch ADB Debugging off at boot.'
+        Say '      On the TV: Settings > My Fire TV > Developer Options > ADB Debugging > ON'
+        Say "      (then accept the 'Allow USB debugging' prompt again if it appears)"
+        if ($NonInteractive) {
+            Info 'Waiting up to 5 more minutes for ADB to come back...'
+            if (Wait-ForDevice 300) { Start-Sleep -Seconds 5; Ok 'Device is back online'; return $true }
+            return $false
+        }
+        if (-not (Ask-YesNo 'ADB Debugging is on again; try to reconnect?' 'y')) { return $false }
+        if (Wait-ForDevice 120) { Start-Sleep -Seconds 5; Ok 'Device is back online'; return $true }
+    }
+}
+
+# Reads Android/Fire OS version and CPU ABIs; used to pick matching APK variants.
+function Read-DeviceInfo {
+    $sdk = (Invoke-Dsh @('getprop', 'ro.build.version.sdk')) -replace '\D', ''
+    $script:Dev.Sdk = if ($sdk) { [int]$sdk } else { 0 }
+    $script:Dev.Release = (Invoke-Dsh @('getprop', 'ro.build.version.release')).Trim()
+    $script:Dev.FireOs = (Invoke-Dsh @('getprop', 'ro.build.version.fireos')).Trim()
+    $script:Dev.Abis = (Invoke-Dsh @('getprop', 'ro.product.cpu.abilist')).Trim()
+    if (-not $script:Dev.Abis) { $script:Dev.Abis = (Invoke-Dsh @('getprop', 'ro.product.cpu.abi')).Trim() }
+    $script:Dev.Model = (Invoke-Dsh @('getprop', 'ro.product.model')).Trim()
+    $m = if ($Dev.Model) { $Dev.Model } else { 'unknown model' }
+    $f = if ($Dev.FireOs) { $Dev.FireOs } else { '?' }
+    $r = if ($Dev.Release) { $Dev.Release } else { '?' }
+    $c = if ($Dev.Abis) { $Dev.Abis } else { '?' }
+    Ok "Device: $m, Fire OS $f (Android $r, API $($Dev.Sdk)), CPU: $c"
 }
 
 function Get-Mem {
@@ -341,20 +391,152 @@ function Format-Size($bytes) {
     return ('{0} KB' -f [math]::Floor($bytes / 1024))
 }
 
-function Get-GitHubLatest($repo) {
+# Get-GitHubLatest owner/repo [asset-glob]; {abi} in the glob is tried with each device ABI, then "universal".
+function Get-GitHubLatest($repo, $pattern) {
+    if (-not $pattern) { $pattern = '*.apk' }
     try {
         $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -Headers @{ 'User-Agent' = 'firestick-cleanup' } -UseBasicParsing
     } catch { return $null }
-    $apks = @($rel.assets | Where-Object { $_.name -like '*.apk' })
-    if ($apks.Count -eq 0) { return $null }
+    $assets = @($rel.assets)
+    $abis = @($Dev.Abis -split ',' | Where-Object { $_ }) + @('universal')
+    $cands = if ($pattern -like '*{abi}*') { @($abis | ForEach-Object { $pattern.Replace('{abi}', $_) }) } else { @($pattern) }
+    foreach ($c in $cands) {
+        $a = $assets | Where-Object { $_.name -like $c } | Select-Object -First 1
+        if ($a) {
+            $sha = ''
+            if ($a.PSObject.Properties['digest'] -and ([string]$a.digest) -match '^sha256:([0-9a-f]+)$') { $sha = $Matches[1] }
+            return @{ Url = [string]$a.browser_download_url; Sha = $sha; Asset = [string]$a.name }
+        }
+    }
+    return $null
+}
+
+# SHA-256 of the v1 signing certificate inside an APK, or '' when there is none / it cannot be read.
+function Get-ApkV1CertSha256($file) {
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        Add-Type -AssemblyName System.Security
+        $zip = [IO.Compression.ZipFile]::OpenRead($file)
+        try {
+            $entry = $zip.Entries | Where-Object { $_.FullName -match '^META-INF/[^/]+\.(RSA|DSA|EC)$' } | Select-Object -First 1
+            if (-not $entry) { return '' }
+            $ms = New-Object IO.MemoryStream
+            $st = $entry.Open(); $st.CopyTo($ms); $st.Dispose()
+            $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
+            $cms.Decode($ms.ToArray())
+            $cert = if ($cms.SignerInfos.Count -gt 0 -and $cms.SignerInfos[0].Certificate) { $cms.SignerInfos[0].Certificate } else { $cms.Certificates[0] }
+            $sha = [Security.Cryptography.SHA256]::Create()
+            return ([BitConverter]::ToString($sha.ComputeHash($cert.RawData)) -replace '-', '').ToLower()
+        } finally { $zip.Dispose() }
+    } catch { return '' }
+}
+
+# Test-Apk <file> [expected signing-cert sha256] -> $true when the file is acceptable
+function Test-Apk($file, $want) {
+    $fs = [IO.File]::OpenRead($file); $b = New-Object byte[] 2; [void]$fs.Read($b, 0, 2); $fs.Dispose()
+    if (-not ($b[0] -eq 0x50 -and $b[1] -eq 0x4B)) { Err "$([IO.Path]::GetFileName($file)) is not an APK (not a zip file)."; return $false }
+    if (-not $want) { return $true }
+    $got = Get-ApkV1CertSha256 $file
+    if (-not $got) { Info 'APK has no readable v1 signature block; the signing certificate cannot be checked here.'; return $true }
+    if ($got -ne $want) { Err "Signing certificate mismatch (expected $want, got $got). Refusing to install."; return $false }
+    Ok "Signing certificate matches APKMirror's record for this app"
+    return $true
+}
+
+function Open-Url($url) {
+    if ($env:FSC_BROWSER) { Start-Process -FilePath $env:FSC_BROWSER -ArgumentList $url | Out-Null; return }
+    Start-Process $url | Out-Null
+}
+
+# Waits for a new, complete <package>_*.apk in the watched folders; returns its path or $null.
+function Wait-ForDownload($pkg, [datetime]$since, $timeoutSec) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
+        $f = Get-ChildItem -Path @($DownloadsWatch, $PlatformDir) -Filter "${pkg}_*.apk" -File -ErrorAction SilentlyContinue |
+             Where-Object { $_.LastWriteTime -gt $since } | Select-Object -First 1
+        if ($f) {
+            $size1 = $f.Length; Start-Sleep -Seconds 2; $size2 = (Get-Item $f.FullName).Length
+            if ($size1 -eq $size2 -and $size1 -gt 100000 -and -not (Test-Path "$($f.FullName).crdownload") -and -not (Test-Path "$($f.FullName).part")) { return $f.FullName }
+        }
+        Start-Sleep -Seconds 2
+    }
+    return $null
+}
+
+function Get-ApkMirrorRecord($pkg) {
+    if ($env:FSC_APKMIRROR_JSON) { return (Get-Content -Raw -Path $env:FSC_APKMIRROR_JSON | ConvertFrom-Json) }
+    return Invoke-RestMethod -Method Post -Uri $ApkMirrorApi -Headers @{ Authorization = $ApkMirrorAuth; 'User-Agent' = 'APKUpdater-v3.0.3' } `
+        -ContentType 'application/json' -Body "{""pnames"":[""$pkg""]}" -UseBasicParsing
+}
+
+# Picks the newest APKMirror variant that fits this device (min API <= device API, matching CPU).
+function Find-ApkMirrorVariant($pkg) {
+    try { $rec = Get-ApkMirrorRecord $pkg } catch { return $null }
+    $item = @($rec.data | Where-Object { $_.pname -eq $pkg }) | Select-Object -First 1
+    if (-not $item -or -not $item.exists) { return $null }
+    $abis = @($Dev.Abis -split ',' | Where-Object { $_ })
+    $best = $null; $bestScore = -1
+    foreach ($a in @($item.apks)) {
+        $minapi = [int]$a.minapi
+        if ($Dev.Sdk -gt 0 -and $minapi -gt $Dev.Sdk) { continue }
+        $arches = @($a.arches); $fits = ($arches.Count -eq 0); $arm64 = 0
+        foreach ($ar in $arches) {
+            if ($ar -eq 'universal' -or $ar -eq 'noarch' -or $abis -contains $ar) { $fits = $true; if ($ar -eq 'arm64-v8a') { $arm64 = 1 } }
+        }
+        if (-not $fits) { continue }
+        $score = $minapi * 10 + $arm64 * 5 + $(if (@($a.dpis) -contains 'nodpi') { 1 } else { 0 })
+        if ($score -gt $bestScore) { $bestScore = $score; $best = $a }
+    }
+    if (-not $best) { return $null }
     $sha = ''
-    if ($apks.Count -eq 1 -and $apks[0].PSObject.Properties['digest'] -and ([string]$apks[0].digest) -match '^sha256:([0-9a-f]+)$') { $sha = $Matches[1] }
-    return @{ Url = [string]$apks[0].browser_download_url; Sha = $sha }
+    if ($best.PSObject.Properties['signatures-sha256']) { $sha = [string](@($best.'signatures-sha256')[0]) }
+    return @{ Version = [string]$item.release.version; VCode = [string]$best.version_code; MinApi = [int]$best.minapi
+              Arches = (@($best.arches) -join ','); Sha = $sha; Page = 'https://www.apkmirror.com' + [string]$best.link }
+}
+
+# Browser-assisted APKMirror download. Returns the local APK path or $null.
+function Get-ApkMirrorApk($sec, $pkg) {
+    $name = Get-Conf1 $sec 'name'
+    Info "Looking up $name on APKMirror for Android API $($Dev.Sdk) ($(if ($Dev.Abis) { $Dev.Abis } else { 'unknown CPU' }))..."
+    $v = Find-ApkMirrorVariant $pkg
+    if ($v) {
+        Ok "Latest: $name $($v.Version) (build $($v.VCode), min API $($v.MinApi), $($v.Arches))"
+        $page = $v.Page
+        New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
+        $cached = Get-ChildItem -Path $DownloadDir -Filter "${pkg}_*.apk" -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -like "*-$($v.VCode)_*" -or $_.Name -like "*-$($v.VCode).apk" } | Select-Object -First 1
+        if ($cached) { $script:ExpectedVCode = $v.VCode; Ok "Already downloaded: $($cached.Name)"; return $cached.FullName }
+    } else {
+        Warn "Could not query APKMirror; you will have to pick a version yourself (min Android API $($Dev.Sdk) or lower)."
+        $page = Get-Conf1 $sec 'page'
+        if (-not $page) { Err "No APKMirror page configured for $name."; return $null }
+    }
+    if ($NonInteractive) {
+        Err "APKMirror does not allow scripted downloads. Save the ${pkg}_*.apk file in $PlatformDir and run again."
+        return $null
+    }
+    Say ''
+    Say '  APKMirror does not let scripts download files, so your browser will open on the'
+    Say "  download page for $name$(if ($v) { ' ' + $v.Version }) that matches this Fire TV."
+    Say "  Click 'DOWNLOAD APK' there (and the 'here' link if nothing starts)."
+    Say "  Watching $DownloadsWatch and $PlatformDir for the file..."
+    $since = Get-Date
+    Open-Url $page
+    $found = Wait-ForDownload $pkg $since 900
+    if (-not $found) { Err "No ${pkg}_*.apk appeared within 15 minutes. Save it in $PlatformDir and run again."; return $null }
+    New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
+    $apk = Join-Path $DownloadDir ([IO.Path]::GetFileName($found))
+    if ($found -ne $apk) { Move-Item -Path $found -Destination $apk -Force }
+    Ok "Got $([IO.Path]::GetFileName($apk)) ($(Format-Size (Get-Item $apk).Length))"
+    if (-not (Test-Apk $apk $(if ($v) { $v.Sha } else { '' }))) { return $null }
+    if ($v) { $script:ExpectedVCode = $v.VCode }
+    return $apk
 }
 
 # Returns the local APK path for a section, or $null.
 function Get-Apk($sec) {
     $name = Get-Conf1 $sec 'name'; $source = Get-Conf1 $sec 'source'
+    $script:ExpectedVCode = ''
     foreach ($glob in ((Get-Conf1 $sec 'apk_glob') -split '\s+')) {
         if (-not $glob) { continue }
         $f = Get-ChildItem -Path $PlatformDir -Filter $glob -File -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -362,8 +544,8 @@ function Get-Apk($sec) {
     }
     if ($source.StartsWith('github:')) {
         Info "Fetching latest $name release from GitHub..."
-        $rel = Get-GitHubLatest $source.Substring(7)
-        if ($rel) { $url = $rel.Url; $sha = $rel.Sha }
+        $rel = Get-GitHubLatest $source.Substring(7) (Get-Conf1 $sec 'asset_match')
+        if ($rel) { $url = $rel.Url; $sha = $rel.Sha; Info "Release asset: $($rel.Asset)" }
         else {
             $url = Get-Conf1 $sec 'fallback_url'; $sha = ''
             if (-not $url) { Err "Could not query GitHub releases for $name."; return $null }
@@ -386,6 +568,7 @@ function Get-Apk($sec) {
         } else { Ok "Downloaded ($(Format-Size $size))" }
         return $apk
     }
+    if ($source.StartsWith('apkmirror:')) { return (Get-ApkMirrorApk $sec $source.Substring(10)) }
     if ($source.StartsWith('manual:')) {
         Err "$name has to be downloaded by hand from $($source.Substring(7))"
         Say "       Save the APK in: $PlatformDir"
@@ -408,6 +591,14 @@ function Install-Apk($sec, $apk) {
     if ($out -notmatch 'Success') { Err "Install failed: $out"; return $false }
     if (-not (Test-Installed $pkg)) { Err "Install reported success but $pkg is not on the device."; return $false }
     Ok "$name installed"
+    if ($script:ExpectedVCode) {
+        $dump = Invoke-Dsh @('dumpsys', 'package', $pkg)
+        if ($dump -match 'versionCode=(\d+)') {
+            if ($Matches[1] -ne $script:ExpectedVCode) { Warn "Installed build $($Matches[1]) differs from the expected build $($script:ExpectedVCode)" }
+            else { Ok "Installed build $($Matches[1])" }
+        }
+        $script:ExpectedVCode = ''
+    }
     Add-State 'installed' $pkg
     return $true
 }
@@ -457,14 +648,79 @@ function Set-AppConfig($sec) {
         else { Err "Could not enable the accessibility service for $pkg"; return $false }
     }
     if ($nl) { Enable-SecureList 'enabled_notification_listeners' $nl $pkg; Ok 'Notification listener enabled' }
+    foreach ($op in ((Get-Conf1 $sec 'appops') -split '\s+')) {
+        if (-not $op) { continue }
+        Invoke-Dsh @('appops', 'set', $pkg, $op, 'allow') | Out-Null
+        Ok "App op $op allowed"
+    }
+    if ((Get-Conf1 $sec 'boot') -eq 'yes') { Set-BootReady $sec }
     if ((Get-Conf1 $sec 'type') -eq 'launcher') {
-        Invoke-Dsh @('appops', 'set', $pkg, 'SYSTEM_ALERT_WINDOW', 'allow') | Out-Null; Ok 'Overlay permission granted'
         Invoke-Dsh @('cmd', 'role', 'add-role-holder', 'android.app.role.HOME', $pkg) | Out-Null; Ok 'HOME role assigned'
         Invoke-Dsh @('cmd', 'package', 'set-home-activity', '--user', '0', $act) | Out-Null; Ok 'Default home activity set'
     }
     Disable-ReplacedPackages $sec
     Start-App $sec
     return $true
+}
+
+# Keeps an app's boot receiver and accessibility service from being throttled. Best effort per firmware.
+function Set-BootReady($sec) {
+    $pkg = Get-Conf1 $sec 'package'
+    Invoke-Dsh @('dumpsys', 'deviceidle', 'whitelist', "+$pkg") | Out-Null
+    Invoke-Dsh @('appops', 'set', $pkg, 'RUN_IN_BACKGROUND', 'allow') | Out-Null
+    Invoke-Dsh @('appops', 'set', $pkg, 'RUN_ANY_IN_BACKGROUND', 'allow') | Out-Null
+    Invoke-Dsh @('am', 'set-standby-bucket', $pkg, 'active') | Out-Null
+    if ((Invoke-Dsh @('dumpsys', 'deviceidle', 'whitelist')) -like "*$pkg*") { Ok 'Allowed to run at boot and in the background' }
+    else { Info "Could not add $pkg to the doze whitelist (not supported on this firmware)" }
+}
+
+# Package holding the HOME role. Android 12+ has get-role-holders; older firmware is asked who resolves HOME.
+function Get-HomeRoleHolder {
+    $out = (Invoke-Dsh @('cmd', 'role', 'get-role-holders', 'android.app.role.HOME')).Trim()
+    if (-not $out -or $out -match 'Unknown command|Error|Exception') {
+        # Android 11: read the role dump ("name=android.app.role.HOME" then "holders=pkg").
+        $out = ''; $found = $false
+        foreach ($l in ((Invoke-Dsh @('dumpsys', 'role')) -split "`n")) {
+            if ($l -match 'name=android\.app\.role\.HOME\s*$') { $found = $true; continue }
+            if ($found -and $l -match 'holders=(.*)$') { $out = $Matches[1].Trim(); break }
+        }
+    }
+    return (($out -split "`n")[0] -replace '[/;,].*$', '')
+}
+
+# Package name of the window that currently has focus, or ''.
+function Get-ForegroundPackage {
+    $line = Invoke-Dsh @('dumpsys window 2>/dev/null | grep -m1 mCurrentFocus')
+    if (-not $line.Trim()) { $line = Invoke-Dsh @('dumpsys activity activities 2>/dev/null | grep -m1 mResumedActivity') }
+    if ($line -match ' u\d+ ([A-Za-z0-9_.]+)/') { return $Matches[1] }
+    return ''
+}
+
+# After the reboot: waits for boot, checks the launcher and boot add-ons are running, tests the Home redirect.
+function Test-BootState($launcher, [string[]]$addons) {
+    Banner 'STEP 8: Checking what starts at boot'
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt 90 -and ((Invoke-Dsh @('getprop', 'sys.boot_completed')) -replace '\D', '') -ne '1') { Start-Sleep -Seconds 3 }
+    Start-Sleep -Seconds 10
+    foreach ($sec in (@($launcher) + @($addons))) {
+        if ((Get-Conf1 $sec 'boot') -ne 'yes') { continue }
+        $pkg = Get-Conf1 $sec 'package'; $name = Get-Conf1 $sec 'name'
+        $count = (Invoke-Dsh @("(ps -A 2>/dev/null || ps) | grep -c $pkg")) -replace '\D', ''
+        if ($count -and [int]$count -gt 0) { Ok "$name is running after boot" } else { Warn "$name is not running after boot" }
+    }
+    $pkg = Get-Conf1 $launcher 'package'; $name = Get-Conf1 $launcher 'name'
+    $fg = Get-ForegroundPackage
+    if ($fg -eq $pkg) { Ok "On screen after boot: $name"; return }
+    Info "On screen after boot: $(if ($fg) { $fg } else { 'unknown' }). Pressing Home to test the redirect..."
+    Invoke-Dsh @('input', 'keyevent', '3') | Out-Null
+    Start-Sleep -Seconds 7
+    $fg = Get-ForegroundPackage
+    if ($fg -eq $pkg) { Ok "After pressing Home: $name takes over" }
+    else {
+        Warn "After pressing Home: $(if ($fg) { $fg } else { 'unknown' }) is still in front."
+        Say "      On the TV, check: Home on Fire > 'Choose target app' is set and 'Launch on boot' is on;"
+        Say "      Projectivy > Settings > General > 'Override current launcher' (OFF if you use Home on Fire)."
+    }
 }
 
 function Show-Notes($sec) {
@@ -672,7 +928,7 @@ function Split-Bloat([string[]]$bloat) {
 function Show-Status {
     Banner "STATUS for $Target"
     $acc = (Invoke-Dsh @('settings', 'get', 'secure', 'enabled_accessibility_services')).Trim()
-    $role = (Invoke-Dsh @('cmd', 'role', 'get-role-holders', 'android.app.role.HOME')).Trim()
+    $role = Get-HomeRoleHolder
     $dis = Get-DisabledNow
     foreach ($k in (Get-Sections)) {
         $pkg = Get-Conf1 $k 'package'; $name = Get-Conf1 $k 'name'
@@ -740,12 +996,26 @@ function Invoke-Revert {
 function Test-App($sec) {
     $pkg = Get-Conf1 $sec 'package'; $name = Get-Conf1 $sec 'name'
     if (Test-Installed $pkg) { Ok "$name is installed" } else { Err "$name is NOT installed" }
+    foreach ($p in ((Get-Conf1 $sec 'grant') -split '\s+')) {
+        if (-not $p) { continue }
+        $short = $p.Split('.')[-1]
+        if ((Invoke-Dsh @('dumpsys', 'package', $pkg)) -like "*$p`: granted=true*") { Ok "$name has $short"; continue }
+        # Grants made shortly before a reboot can be lost; grant again and re-check.
+        Invoke-Dsh @('pm', 'grant', $pkg, $p) | Out-Null
+        if ((Invoke-Dsh @('dumpsys', 'package', $pkg)) -like "*$p`: granted=true*") { Ok "$name has $short (granted again; the first grant did not persist)" }
+        elseif ($p -eq 'android.permission.WRITE_SECURE_SETTINGS' -and (Get-Conf1 $sec 'accessibility')) {
+            Warn "$short cannot be granted on this firmware."
+            Say '      Not a problem: the accessibility service was enabled directly over adb instead;'
+            Say "      only the app's own in-app accessibility toggle needs that permission."
+        }
+        else { Err "$name is missing $short (grant it with: adb shell pm grant $pkg $p)" }
+    }
     if (Get-Conf1 $sec 'accessibility') {
         if ((Invoke-Dsh @('settings', 'get', 'secure', 'enabled_accessibility_services')) -like "*$pkg*") { Ok "$name accessibility service is active" }
         else { Err "$name accessibility service is NOT active" }
     }
     if ((Get-Conf1 $sec 'type') -eq 'launcher') {
-        if ((Invoke-Dsh @('cmd', 'role', 'get-role-holders', 'android.app.role.HOME')) -like "*$pkg*") { Ok "$name holds the HOME role" }
+        if ((Get-HomeRoleHolder) -eq $pkg) { Ok "$name holds the HOME role" }
         else { Warn "$name does not hold the HOME role (expected on some firmware; the Home-button service still works)" }
     }
 }
@@ -799,6 +1069,7 @@ function Invoke-Install {
     Test-App $script:LauncherKey
     foreach ($a in @($script:ChosenAddons -split ',' | Where-Object { $_ })) { Test-App $a }
     Say "  [OK] $((Get-DisabledNow).Count) packages are disabled on the device"
+    Test-BootState $script:LauncherKey @($script:ChosenAddons -split ',' | Where-Object { $_ })
 
     $after = Get-Mem
     Banner 'RAM: before vs after'
@@ -854,6 +1125,20 @@ function Invoke-Reapply {
     Say "  Disabled this run: $($script:TotalDisabled) (protected: $($script:TotalProtected))"
 }
 
+function Invoke-TestBoot {
+    $lk = Get-State1 'launcher'
+    if (-not $lk) { Die "No saved state for $FireIp; run an install first." }
+    Banner "BOOT TEST on $Target"
+    if (-not (Restart-Device)) { Die 'Could not reconnect after reboot.' }
+    Invoke-ReapplyDisabled
+    if ($script:Reapplied -gt 0) { Ok "Re-disabled $($script:Reapplied) packages that came back after the reboot" }
+    else { Ok 'All packages stayed disabled after the reboot' }
+    $addons = @((Get-State1 'addons') -split ',' | Where-Object { $_ })
+    Test-App $lk
+    foreach ($a in $addons) { Test-App $a }
+    Test-BootState $lk $addons
+}
+
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
@@ -871,11 +1156,13 @@ Ok "ADB: $ADB"
 
 Read-Ip
 if (-not (Connect-Device)) { Die 'Connection failed.' }
+Read-DeviceInfo
 
 switch ($Mode) {
     'status'  { Show-Status }
     'revert'  { Invoke-Revert }
     'reapply' { Invoke-Reapply }
+    'test-boot' { Invoke-TestBoot }
     default   { Invoke-Install }
 }
 

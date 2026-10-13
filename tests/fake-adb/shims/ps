@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# One process line per running package (set by the reboot shim; everything installed runs after boot).
+cat "$FAKE_DEV/running" 2>/dev/null

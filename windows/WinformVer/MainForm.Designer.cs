@@ -17,6 +17,7 @@ namespace FirestickCleanup
         private Button btnStart;
         private Button btnReapply;
         private Button btnStatus;
+        private Button btnTestBoot;
         private Button btnRevert;
         private ProgressBar progressBar;
         private Label lblStatus;
@@ -48,6 +49,7 @@ namespace FirestickCleanup
             this.btnStart = new Button();
             this.btnReapply = new Button();
             this.btnStatus = new Button();
+            this.btnTestBoot = new Button();
             this.btnRevert = new Button();
             this.progressBar = new ProgressBar();
             this.lblStatus = new Label();
@@ -124,7 +126,13 @@ namespace FirestickCleanup
             this.btnStatus.Click += new System.EventHandler(this.BtnStatus_Click);
             this.toolTip.SetToolTip(this.btnStatus, "Show what is installed and disabled. Changes nothing.");
 
-            this.btnRevert.Location = new Point(406, 354);
+            this.btnTestBoot.Location = new Point(406, 354);
+            this.btnTestBoot.Size = new Size(110, 32);
+            this.btnTestBoot.Text = "Test boot";
+            this.btnTestBoot.Click += new System.EventHandler(this.BtnTestBoot_Click);
+            this.toolTip.SetToolTip(this.btnTestBoot, "Reboot the Fire TV and check that the launcher and add-ons come up.");
+
+            this.btnRevert.Location = new Point(524, 354);
             this.btnRevert.Size = new Size(120, 32);
             this.btnRevert.Text = "Revert";
             this.btnRevert.Click += new System.EventHandler(this.BtnRevert_Click);
@@ -165,6 +173,7 @@ namespace FirestickCleanup
             this.Controls.Add(this.btnStart);
             this.Controls.Add(this.btnReapply);
             this.Controls.Add(this.btnStatus);
+            this.Controls.Add(this.btnTestBoot);
             this.Controls.Add(this.btnRevert);
             this.Controls.Add(this.progressBar);
             this.Controls.Add(this.lblStatus);

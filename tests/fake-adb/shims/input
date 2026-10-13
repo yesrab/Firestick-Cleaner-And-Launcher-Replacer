@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# input keyevent 3 (Home): a Home-button hook (any enabled accessibility service) brings the HOME role holder to the front.
+if [ "$1 $2" = "keyevent 3" ] && grep -q '^enabled_accessibility_services=.' "$FAKE_DEV/settings"; then cat "$FAKE_DEV/role" > "$FAKE_DEV/foreground"; fi

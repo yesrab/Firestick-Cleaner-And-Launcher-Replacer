@@ -6,9 +6,9 @@ Replace the ad-filled Amazon Fire TV home screen with a launcher of your choice 
 
 ## What it does
 
-1. Connects to your Fire TV over ADB (Wi-Fi) and waits for you to accept the prompt on the TV
+1. Connects to your Fire TV over ADB (Wi-Fi), waits for you to accept the prompt on the TV, and reads its Fire OS version, Android API level and CPU type
 2. Installs the launcher you pick: **Projectivy**, **AT4K** or **Couchy**
-3. Optionally installs add-ons: **Home on Fire** (makes the Home button open your launcher) and **YouTube for Android TV** (Google's official app in place of Amazon's YouTube wrapper)
+3. Optionally installs add-ons: **Home on Fire** (makes the Home button open your launcher), **YouTube for Android TV** or **SmartTube** (in place of Amazon's YouTube wrapper) and the **Google app for Android TV**, each in the build that matches your device
 4. Asks which optional Amazon apps you want to keep (Music, Photos, Appstore, Prime Video services...)
 5. Disables tracking, telemetry, ads and background bloat, plus your optional choices
 6. Reboots, verifies, and re-disables anything Amazon re-enabled during the reboot
@@ -20,7 +20,7 @@ Replace the ad-filled Amazon Fire TV home screen with a launcher of your choice 
 | Launcher | Home button handling | APK | Notes |
 |----------|---------------------|-----|-------|
 | [Projectivy Launcher](https://github.com/spocky/miproja1) (default) | Its own accessibility service | Downloaded automatically from GitHub, SHA-256 verified | Feature-rich. After install, enable **Settings > General > Override current launcher** in Projectivy. |
-| [AT4K Launcher](https://at4k.com/) | Its own accessibility service | **Not bundled.** Download it yourself and save it next to the script as `AT4K*.apk` or `base.apk` | Lightweight. |
+| [AT4K Launcher](https://at4klauncher.com/) | Its own accessibility service | **Not bundled.** It is a paid app sold on Google Play; you must supply the APK and save it next to the script as `AT4K*.apk` or `base.apk` | Lightweight. |
 | [Couchy Launcher](https://github.com/conreo/couchy-launcher) | None. Pair it with Home on Fire | Downloaded automatically from GitHub, SHA-256 verified | Minimal, open source, no Google services needed. |
 
 ## Add-ons
@@ -29,15 +29,37 @@ Add-ons are asked about one by one after the launcher, and can be forced with `-
 
 ### Home on Fire (`homeonfire`)
 
-[Home on Fire](https://github.com/toolicious/home-on-fire) is a tiny open-source app that intercepts the Home button and opens the launcher you choose. It is **required for Couchy** (which has no Home-button service of its own, so the prompt defaults to yes there) and optional for Projectivy and AT4K, which bring their own. The script downloads and verifies it, grants it the `WRITE_SECURE_SETTINGS` permission and enables its accessibility service. You then pick your launcher once under **Choose target app** inside the app.
+[Home on Fire](https://github.com/toolicious/home-on-fire) is a tiny open-source app that intercepts the Home button and opens the launcher you choose, and launches it at boot and on wake. It is **required for Couchy** (which has no Home-button service of its own, so the prompt defaults to yes there) and optional for Projectivy and AT4K, which bring their own. The script downloads and verifies it, grants it the `WRITE_SECURE_SETTINGS` permission its README asks for, enables its accessibility service, and verifies the grant afterwards. Its **Launch on boot** and **Accessibility service** switches are on by default; you pick your launcher once under **Choose target app** inside the app. If you combine it with Projectivy, leave Projectivy's **Override current launcher** off: the two hooks conflict.
 
 Known behaviour from the Home on Fire project: on Fire OS 8 the Amazon home screen flashes briefly before your launcher appears; on Fire OS 7 a Home press can take a few seconds. Long-press Home to get back to the Amazon home screen at any time. Fire OS 6 and older are not supported.
 
 ### YouTube for Android TV (`youtubetv`)
 
-Replaces Amazon's Fire TV YouTube wrapper (`com.amazon.firetv.youtube`) with Google's official YouTube for Android TV app (`com.google.android.youtube.tv`), the same app that ships on Android TV and Google TV devices. The script installs the APK, disables the Amazon wrapper so only one YouTube shows in your launcher, and records that so `--revert` puts the Amazon app back.
+Replaces Amazon's Fire TV YouTube wrapper (`com.amazon.firetv.youtube`) with Google's official YouTube for Android TV app (`com.google.android.youtube.tv`), the same app that ships on Android TV and Google TV devices. The Amazon wrapper is disabled so only one YouTube shows in your launcher, and that is recorded so `--revert` puts it back.
 
-Google does not publish this APK for direct download, so **you have to supply it**: download the current release from a mirror you trust (for example the [APKMirror listing](https://www.apkmirror.com/apk/google-inc/youtube-for-android-tv/), which checks that uploads carry Google's signature) and save it next to the entry point as `YouTube*.apk`. Pick the newest version whose minimum Android matches your Fire OS (Fire OS 7 is Android 9, Fire OS 8 is Android 11). Sign-in uses the on-screen code at youtube.com/activate; on some Fire OS versions sign-in needs Google services and does not work, but playback works signed out.
+Google does not publish this APK, and APKMirror, the usual mirror, does not allow programs to download files (its download endpoint is blocked for scripts and excluded in its robots.txt). So the tool does everything except the final click:
+
+1. It reads the Fire TV's Android API level and CPU type over adb (Fire OS 7 is API 28, Fire OS 8 is API 30; sticks are `armeabi-v7a`, newer models also `arm64-v8a`).
+2. It asks APKMirror's metadata API, the same one the open-source APKUpdater app uses, for the newest release and picks the variant whose minimum API and CPU fit your device.
+3. It opens exactly that download page in your browser. You click **DOWNLOAD APK**.
+4. It watches your Downloads folder (and the script folder), picks the file up, checks it is a real APK, and compares its signing certificate with the one APKMirror recorded for that release when the APK carries a v1 signature. Android verifies the signature again on install.
+5. After installing it confirms the installed build number matches.
+
+The file is cached under `downloads/`, so later runs and `--reapply` need no click. In `--non-interactive` mode the click is impossible, so place a `com.google.android.youtube.tv_*.apk` next to the entry point beforehand. If your browser saves downloads somewhere unusual, set `FSC_DOWNLOADS_DIR`.
+
+Sign-in uses the on-screen code at youtube.com/activate. On some Fire OS versions sign-in needs Google Play Services, which Fire OS does not have, and will not work; playback works signed out. If you want an account without Google services, use SmartTube instead.
+
+### SmartTube (`smarttube`)
+
+[SmartTube](https://github.com/yuliskov/SmartTube) is an open-source YouTube client for TVs: ad-free, signs in with a youtube.com/activate code, and needs no Google services at all, so it is the most reliable way to get your account on a Fire TV. It is downloaded from its GitHub releases, verified against the release's SHA-256 digest, and the build for your CPU (`arm64-v8a`, `armeabi-v7a` or universal) is chosen automatically. It leaves the Amazon YouTube app alone; add `youtubetv` as well if you want that disabled.
+
+### Google app for Android TV (`googleapp`)
+
+Google's Assistant and voice-search app for Android TV (`com.google.android.katniss`), fetched the same assisted way as YouTube. It is marked experimental: it depends on Google Play Services, which cannot be installed on an unrooted Fire TV, so it may refuse to start. `--revert` removes it.
+
+### Why not microG?
+
+microG reimplements Google Play Services, but Google's own apps (YouTube, the Google app) only accept it when the system allows signature spoofing, which needs root or a custom ROM. Fire TV offers neither, so microG cannot provide sign-in for the official YouTube app here. SmartTube does not need any of this.
 
 ## Platforms
 
@@ -95,11 +117,13 @@ Modes (default: full install)
   --reapply           Re-disable packages using the saved choices (after a Fire OS update)
   --status            Show launcher, Home on Fire and disabled-package state; change nothing
   --dry-run           Show what would be done; change nothing
+  --test-boot         Reboot the Fire TV and check the launcher and add-ons come up (run it after
+                      the on-TV steps, or any time you want a cold-boot check)
 
 Options
   --ip <ip[:port]>    Fire TV address (skips the prompt; the last used address is remembered)
   --launcher <key>    projectivy | at4k | couchy   (default: projectivy)
-  --with <a,b,..>     Add-ons to install: homeonfire, youtubetv
+  --with <a,b,..>     Add-ons to install: homeonfire, youtubetv, smarttube, googleapp
   --without <a,b,..>  Add-ons to skip (--home-on-fire / --no-home-on-fire are shorthands for homeonfire)
   --disable <a,b,..>  Optional groups to disable, comma-separated (keys from packages.conf)
   -y, --non-interactive
@@ -109,8 +133,8 @@ Options
 Examples:
 
 ```
-# Couchy + Home on Fire + YouTube for Android TV, also disable the video stack and update services, no questions asked
-./Firestick-Cleaner-And-Launcher-Replacer.sh --ip 10.0.0.20 --launcher couchy --with homeonfire,youtubetv --disable video,updates -y
+# Couchy + Home on Fire + SmartTube, also disable the video stack and update services, no questions asked
+./Firestick-Cleaner-And-Launcher-Replacer.sh --ip 10.0.0.20 --launcher couchy --with homeonfire,smarttube --disable video,updates -y
 
 # After a Fire OS update put everything back the way it was
 ./Firestick-Cleaner-And-Launcher-Replacer.sh --ip 10.0.0.20 --reapply -y
@@ -191,11 +215,26 @@ Everything below lives in `common/packages.conf`. The `[always]` group is disabl
 
 These are protected on every firmware we have seen, or needed for basic operation, so the script leaves them alone: `com.amazon.device.metrics`, `com.amazon.client.metrics`, `com.amazon.device.logmanager`, `com.amazon.device.sync`, `com.amazon.securitysyncclient`, `com.amazon.ftvads.deeplinking`, `com.amazon.tv.csapp`, `com.amazon.tv.oobe`, `com.amazon.tv.settings`.
 
+## Starting at boot
+
+Fire OS always boots into Amazon's home screen on firmware where the stock launcher is protected. Your launcher appears because a Home-button hook (Projectivy's or AT4K's accessibility service, or Home on Fire) takes over, and Home on Fire additionally launches the target right after boot. The tool prepares every launcher and boot add-on for that (`boot=yes` in `launchers.conf`):
+
+- grants the permissions and app ops each app's docs ask for (Home on Fire: `WRITE_SECURE_SETTINGS`; launchers: `SYSTEM_ALERT_WINDOW`), then verifies the grants
+- enables the accessibility service with the fully qualified component name used by the community Fire TV guides
+- puts the app on the doze whitelist, allows background execution and keeps it in the "active" standby bucket so its boot receiver and service are not throttled
+- assigns the HOME role and default home activity to the launcher
+
+After the final reboot it waits for `sys.boot_completed`, checks that the launcher and every boot add-on process is running, reads which app is on screen, and if Amazon's home is in front it presses Home over adb and checks again that your launcher takes over. Anything that fails is reported with the setting to check on the TV. `--test-boot` repeats the reboot and this check on demand, for example after you have picked the target in Home on Fire. Fire OS updates can clear these settings; run `--reapply`.
+
+Some Fire OS builds switch **ADB Debugging** off at boot. Before every reboot the tool asks Fire OS to keep it on (best effort), and if the device does not come back it stops, tells you which toggle to turn on (Settings > My Fire TV > Developer Options > ADB Debugging) and waits for you instead of aborting; in non-interactive mode it waits five extra minutes.
+
+Two more Fire OS quirks the tool allows for: the package manager saves package state a few seconds after the fact, so the tool waits before rebooting (otherwise the last changes, including the Home on Fire grant, are lost), and on Android 11 (Fire OS 8) the HOME role is read from `dumpsys role` because `cmd role get-role-holders` only exists from Android 12. Amazon's own launcher keeps a hard-coded priority on the HOME intent, so it still appears first at boot even when your launcher holds the role; the Home-button hook is what gets you to your launcher.
+
 ## How it works
 
 Amazon protects the stock launcher as a system package on most firmware, so it usually cannot be disabled. Instead, a launcher's **accessibility service** (Projectivy, AT4K) or **Home on Fire** intercepts the Home button and opens your launcher. The script:
 
-1. Installs the APK with `pm install -r` (GitHub downloads are checked against the release's SHA-256 digest)
+1. Reads the device's API level and CPU ABIs with `getprop`, then installs the APK with `pm install -r`. GitHub downloads are checked against the release's SHA-256 digest and the asset matching the CPU is chosen; APKMirror downloads are matched to the device's API level and CPU and their signing certificate is compared with APKMirror's record.
 2. Appends the accessibility service (and notification listener, if any) to the existing `enabled_accessibility_services` secure setting, recording the previous value for revert
 3. Grants the overlay permission, assigns the `android.app.role.HOME` role and sets the default home activity
 4. Disables packages in one device-side batch per pass; if some are protected it reboots once and retries
@@ -205,7 +244,8 @@ Amazon protects the stock launcher as a system package on most firmware, so it u
 ## Customising
 
 - **Packages:** edit `common/packages.conf`. Add a line to a group, or add a new `[key] Prompt text` group and it becomes a new Y/N question and `--disable` key on every platform.
-- **Launchers and add-ons:** edit `common/launchers.conf`. Adding a launcher is a new `type=launcher` section with its package, activity, optional accessibility service and APK source. Adding an add-on is a `type=addon` section with a prompt, an optional `disables=` list of packages it replaces, and the same install fields. No code changes are needed.
+- **Launchers and add-ons:** edit `common/launchers.conf`. Adding a launcher is a new `type=launcher` section with its package, activity, optional accessibility service and APK source. Adding an add-on is a `type=addon` section with a prompt, an optional `disables=` list of packages it replaces, and the same install fields. Sources are `github:owner/repo` (with an optional `asset_match` glob where `{abi}` stands for the device CPU), `apkmirror:<package>` (browser-assisted, device-matched) or `manual:URL`. No code changes are needed.
+- **Environment variables:** `FSC_DOWNLOADS_DIR` (folder your browser saves to), `FSC_BROWSER` (program used to open download pages).
 
 ## Project structure
 
@@ -228,7 +268,8 @@ Amazon protects the stock launcher as a system package on most firmware, so it u
 │   └── adb/
 ├── tests/
 │   ├── run-e2e.sh                 # end-to-end test against a fake adb (no device needed)
-│   └── fake-adb/                  # the fake adb (adb) and device-side command shims (shims/)
+│   ├── fake-adb/                  # the fake adb (adb) and device-side command shims (shims/)
+│   └── fixtures/                  # recorded APKMirror metadata used by the test
 └── .github/workflows/ci.yml       # shellcheck, e2e test, PowerShell analyzer, WinForms build
 ```
 
@@ -236,7 +277,7 @@ Amazon protects the stock launcher as a system package on most firmware, so it u
 
 ```
 shellcheck -s bash common/firestick-cleanup.sh
-bash tests/run-e2e.sh        # ~1 minute; simulates a Fire TV, needs no network
+bash tests/run-e2e.sh        # ~3 minutes; simulates a Fire TV and a browser download, needs no network
 ```
 
 CI runs those plus a PowerShell parse/analyzer pass and a WinForms build whose output is published as a workflow artifact.
@@ -246,7 +287,7 @@ CI runs those plus a PowerShell parse/analyzer pass and a WinForms build whose o
 - Fire OS updates can undo these changes. Run `--reapply` afterwards, or use the `updates` group to block the update services (at the cost of security fixes).
 - The stock Amazon launcher keeps running in the background on firmware where it is protected (about 110 MB RAM). The `stocklauncher` group tries to disable it anyway and reports "Protected" when it cannot.
 - Each run writes a timestamped `firestick_cleanup_<date>.log` next to the entry point.
-- Tested on Fire TV Stick 4K and Fire TV Stick Lite. Please open an issue with your device, Fire OS version and which packages were reported as protected.
+- Live-tested on a Fire TV Stick running Fire OS 8.1.8.5 (Android 11, 32-bit) with Couchy + Home on Fire; earlier versions were tested on Fire TV Stick 4K and Fire TV Stick Lite. Please open an issue with your device, Fire OS version and which packages were reported as protected.
 
 ## License
 

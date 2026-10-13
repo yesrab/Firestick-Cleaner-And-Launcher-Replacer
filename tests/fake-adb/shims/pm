@@ -7,14 +7,18 @@ case "$sub" in
     src=$(cat "$DEV/last_push_src"); case "$src" in
       ProjectivyLauncher*) p=com.spocky.projengmenu ;; Couchy*|couchy*) p=com.conreo.couchytv ;;
       home-on-fire*) p=io.github.toolicious.homeonfire ;; AT4K*|at4k*|base.apk) p=com.overdevs.at4k ;;
-      YouTube*|youtube*) p=com.google.android.youtube.tv ;; *) echo "Failure [INSTALL_PARSE_FAILED]"; exit 1 ;; esac
-    grep -qx "$p" "$DEV/installed" || echo "$p" >> "$DEV/installed"; echo "Success" ;;
+      YouTube*|youtube*|com.google.android.youtube.tv_*) p=com.google.android.youtube.tv ;;
+      com.google.android.katniss_*) p=com.google.android.katniss ;; SmartTube*) p=org.smarttube.stable ;;
+      *) echo "Failure [INSTALL_PARSE_FAILED]"; exit 1 ;; esac
+    grep -qx "$p" "$DEV/installed" || echo "$p" >> "$DEV/installed"
+    vc=$(printf '%s' "$src" | sed -n 's/^[^_]*_[^-]*-\([0-9]*\)_.*/\1/p'); [ -n "$vc" ] && echo "$p=$vc" >> "$DEV/vcodes"
+    echo "Success" ;;
   disable-user) p="${@: -1}"
     if ! grep -qx "$p" "$DEV/installed"; then echo "Error: java.lang.IllegalArgumentException: Unknown package: $p"
     elif grep -qx "$p" "$DEV/protected"; then echo "Error: java.lang.SecurityException: Cannot disable a protected package: $p"
     else grep -qx "$p" "$DEV/disabled" || echo "$p" >> "$DEV/disabled"; echo "Package $p new state: disabled-user"; fi ;;
   enable) p="${@: -1}"; grep -vx "$p" "$DEV/disabled" > "$DEV/disabled.tmp"; mv "$DEV/disabled.tmp" "$DEV/disabled"; echo "Package $p new state: enabled" ;;
   uninstall) p="${@: -1}"; grep -vx "$p" "$DEV/installed" > "$DEV/installed.tmp"; mv "$DEV/installed.tmp" "$DEV/installed"; echo "Success" ;;
-  grant) ;;
+  grant) echo "$1 $2" >> "$DEV/grants" ;;
   *) echo "pm: unknown $sub" ;;
 esac

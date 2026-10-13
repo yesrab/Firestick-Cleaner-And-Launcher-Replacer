@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+DEV="$FAKE_DEV"
+case "$1" in
+  package)  v=$(sed -n "s/^$2=//p" "$DEV/vcodes" 2>/dev/null); echo "    versionCode=${v:-1} minSdk=21 targetSdk=34"
+            grep "^$2 " "$DEV/grants" 2>/dev/null | awk '{print "      " $2 ": granted=true"}' ;;
+  window)   fg=$(cat "$DEV/foreground" 2>/dev/null || cat "$DEV/role"); echo "  mCurrentFocus=Window{abc u0 $fg/$fg.MainActivity}" ;;
+  deviceidle) case "${2:-}" in
+                whitelist) if [ -n "${3:-}" ]; then echo "${3#+}" >> "$DEV/whitelist"; else sed 's/^/user,/' "$DEV/whitelist" 2>/dev/null; fi ;;
+              esac ;;
+esac

@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
-DEV="$FAKE_DEV"; comp="${@: -1}"; pkg="${comp%%/*}"
+DEV="$FAKE_DEV"
+if [ "$1" = "set-standby-bucket" ]; then exit 0; fi
+comp="${@: -1}"; pkg="${comp%%/*}"
 if grep -qx "$pkg" "$DEV/installed"; then echo "Starting: Intent { cmp=$comp }"; else echo "Error: Activity class {$comp} does not exist."; fi

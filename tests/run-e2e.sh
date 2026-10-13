@@ -22,8 +22,21 @@ printf '%s\n' com.amazon.tv.launcher com.amazon.tv.settings com.amazon.tv.acr co
     com.amazon.firetv.youtube \
     > "$FAKE_DEV/installed"
 printf '%s\n' com.amazon.device.software.ota com.amazon.tv.launcher > "$FAKE_DEV/protected"
-# Local APKs so nothing is downloaded.
-for f in ProjectivyLauncher-test.apk Couchy-Launcher-test.apk home-on-fire-test.apk YouTube-test.apk; do printf 'fake' > "$PLAT/$f"; done
+printf '%s\n' ro.build.version.sdk=28 ro.build.version.release=9 ro.build.version.fireos=7.6.6.9 \
+    ro.product.cpu.abilist=armeabi-v7a,armeabi ro.product.model=AFTMM sys.boot_completed=1 > "$FAKE_DEV/props"
+# Local APKs so nothing is downloaded (YouTube TV is exercised through the assisted-download path instead).
+for f in ProjectivyLauncher-test.apk Couchy-Launcher-test.apk home-on-fire-test.apk SmartTube-test.apk; do printf 'fake' > "$PLAT/$f"; done
+# Assisted APKMirror download: a fixture answers the metadata API and a fake "browser" drops the
+# file into the watched downloads folder, exactly as a real browser would after the user's click.
+export FSC_APKMIRROR_JSON="$ROOT/tests/fixtures/apkmirror-youtube.json"
+export FSC_DOWNLOADS_DIR="$WORK/Downloads"; mkdir -p "$FSC_DOWNLOADS_DIR"
+{ printf 'PK'; head -c 200000 /dev/zero; } > "$WORK/fake-youtube.apk"
+cat > "$WORK/fake-browser.sh" <<EOS
+#!/usr/bin/env bash
+echo "\$1" > "$WORK/opened-url"; sleep 1
+cp "$WORK/fake-youtube.apk" "$FSC_DOWNLOADS_DIR/com.google.android.youtube.tv_7.27.300-727300320_minAPI24(armeabi-v7a)(nodpi)_apkmirror.com.apk"
+EOS
+chmod +x "$WORK/fake-browser.sh"; export FSC_BROWSER="$WORK/fake-browser.sh"
 
 FAILED=0
 run() { FSC_PLATFORM_DIR="$PLAT" bash "$ROOT/common/firestick-cleanup.sh" "$@" 2>&1; }
@@ -34,42 +47,68 @@ assert_eq() { if [ "$2" = "$3" ]; then echo "  PASS: $1"; else echo "  FAIL: $1 
 
 echo "== dry-run =="
 out="$(run --ip 10.0.0.9 --launcher couchy --with youtubetv --disable video,updates,stocklauncher --dry-run -y)"
+assert_contains "device info read over adb" "$out" "Device: AFTMM, Fire OS 7.6.6.9 (Android 9, API 28), CPU: armeabi-v7a,armeabi"
 assert_contains "dry-run lists launcher" "$out" "Launcher:        Couchy Launcher"
 assert_contains "dry-run lists add-ons (homeonfire implied by couchy)" "$out" "Add-ons:         homeonfire,youtubetv"
 assert_contains "dry-run counts present packages" "$out" "Would disable (18)"
 assert_eq "dry-run changed nothing" "$(wc -l < "$FAKE_DEV/disabled" | tr -d ' ')" "0"
 
-echo "== install (couchy + home on fire + youtube tv) =="
-out="$(run --ip 10.0.0.9 --launcher couchy --home-on-fire --with youtubetv --disable video,updates,stocklauncher -y)"
+echo "== non-interactive run cannot use the assisted download =="
+out="$(run --ip 10.0.0.9 --launcher couchy --with youtubetv --disable video -y)"
+assert_contains "variant picked for API 28 / armeabi-v7a" "$out" "Latest: YouTube for Android TV 7.27.300 beta (build 727300320, min API 24, armeabi-v7a)"
+assert_contains "assisted download refused without a human" "$out" "APKMirror does not allow scripted downloads"
+
+echo "== install (couchy + home on fire + youtube tv via assisted download + smarttube) =="
+# Interactive run so the browser-assisted download is allowed; every prompt gets an explicit answer.
+# answers: IP, launcher 3 (couchy), add-ons: homeonfire y, youtubetv y, googleapp n, smarttube y,
+#          groups: video y, 11x Enter (keep), updates y, stocklauncher y, then Enter for each notes pause and to exit
+out="$(printf '10.0.0.9\n3\ny\ny\nn\ny\ny\n\n\n\n\n\n\n\n\n\n\n\ny\ny\n\n\n\n\n\n' | run)"
 assert_contains "launcher installed" "$out" "Couchy Launcher holds the HOME role"
 assert_contains "home on fire configured" "$out" "Home on Fire accessibility service is active"
+assert_contains "home on fire grant verified" "$out" "Home on Fire has WRITE_SECURE_SETTINGS"
+assert_contains "boot prep applied" "$out" "Allowed to run at boot and in the background"
+assert_contains "launcher running after boot" "$out" "Couchy Launcher is running after boot"
+assert_contains "home on fire running after boot" "$out" "Home on Fire is running after boot"
+assert_contains "amazon home in front after boot" "$out" "On screen after boot: com.amazon.tv.launcher"
+assert_contains "home press redirects to launcher" "$out" "After pressing Home: Couchy Launcher takes over"
+assert_contains "browser opened on the matching variant page" "$(cat "$WORK/opened-url")" "youtube-for-android-tv-7-27-300-4-android-apk-download"
+assert_contains "downloaded file picked up" "$out" "Got com.google.android.youtube.tv_7.27.300-727300320_minAPI24(armeabi-v7a)(nodpi)_apkmirror.com.apk"
+assert_contains "installed build verified" "$out" "Installed build 727300320"
 assert_contains "youtube tv installed" "$out" "YouTube for Android TV is installed"
+assert_contains "smarttube installed from local apk" "$out" "SmartTube is installed"
 assert_contains "amazon youtube disabled by add-on" "$out" "Disabled: com.amazon.firetv.youtube (replaced by YouTube for Android TV)"
 assert_contains "protected packages reported" "$out" "Protected: com.amazon.tv.launcher"
 assert_contains "package re-enabled by boot was re-disabled" "$out" "Re-disabled 1 packages"
 assert_eq "17 packages disabled on device" "$(wc -l < "$FAKE_DEV/disabled" | tr -d ' ')" "17"
 assert_eq "HOME role holder" "$(cat "$FAKE_DEV/role")" "com.conreo.couchytv"
-assert_contains "accessibility set" "$(cat "$FAKE_DEV/settings")" "io.github.toolicious.homeonfire/.HijackService"
+assert_contains "accessibility set" "$(cat "$FAKE_DEV/settings")" "io.github.toolicious.homeonfire/io.github.toolicious.homeonfire.HijackService"
 assert_contains "state records launcher" "$(cat "$PLAT/firestick_cleanup_10.0.0.9.state")" "launcher=couchy"
-assert_contains "state records add-ons" "$(cat "$PLAT/firestick_cleanup_10.0.0.9.state")" "addons=homeonfire,youtubetv"
+assert_contains "state records add-ons" "$(cat "$PLAT/firestick_cleanup_10.0.0.9.state")" "addons=homeonfire,youtubetv,smarttube"
+assert_contains "optional groups saved from interactive answers" "$(cat "$PLAT/firestick_cleanup_10.0.0.9.state")" "groups=video,updates,stocklauncher"
 
 echo "== status =="
 out="$(run --ip 10.0.0.9 --status -y)"
 assert_contains "status shows launcher" "$out" "Couchy Launcher: installed, holds HOME role"
 assert_contains "status shows youtube tv" "$out" "YouTube for Android TV: installed"
+assert_contains "status shows smarttube" "$out" "SmartTube: installed"
 assert_contains "status shows disabled count" "$out" "Disabled packages:       17"
+
+echo "== cached download is reused on a second run =="
+out="$(run --ip 10.0.0.9 --launcher couchy --with youtubetv --without smarttube --disable video -y)"
+assert_contains "cached apk reused without a browser" "$out" "Already downloaded: com.google.android.youtube.tv_7.27.300-727300320"
+assert_contains "saved add-ons keep home on fire" "$(cat "$PLAT/firestick_cleanup_10.0.0.9.state")" "addons=homeonfire,youtubetv"
 
 echo "== reapply after simulated Fire OS update =="
 tail -n +4 "$FAKE_DEV/disabled" > "$FAKE_DEV/disabled.tmp"; mv "$FAKE_DEV/disabled.tmp" "$FAKE_DEV/disabled"; : > "$FAKE_DEV/settings"
 out="$(run --ip 10.0.0.9 --reapply -y)"
 assert_contains "reapply re-disables" "$out" "Disabled: com.amazon.hybridadidservice"
 assert_contains "reapply restores home on fire" "$out" "Home on Fire settings re-applied"
-assert_contains "accessibility restored" "$(cat "$FAKE_DEV/settings")" "io.github.toolicious.homeonfire/.HijackService"
+assert_contains "accessibility restored" "$(cat "$FAKE_DEV/settings")" "io.github.toolicious.homeonfire/io.github.toolicious.homeonfire.HijackService"
 
 echo "== interactive install (projectivy, answers piped) =="
-out="$(printf '\n1\nn\nn\n\ny\n\ny\n\n\n\n\n\n\n\n\n\n\n\n\n' | run)"
+out="$(printf '\n1\nn\nn\nn\nn\n\ny\n\ny\n\n\n\n\n\n\n\n\n\n\n\n\n' | run)"
 assert_contains "menu picks projectivy" "$out" "Launcher: Projectivy Launcher"
-assert_contains "projectivy accessibility appended" "$(cat "$FAKE_DEV/settings")" "HijackService:com.spocky.projengmenu/.services.ProjectivyAccessibilityService"
+assert_contains "projectivy accessibility appended" "$(cat "$FAKE_DEV/settings")" "HijackService:com.spocky.projengmenu/com.spocky.projengmenu.services.ProjectivyAccessibilityService"
 assert_contains "optional groups saved" "$(cat "$PLAT/firestick_cleanup_10.0.0.9.state")" "groups=appstore,music"
 assert_contains "no add-ons chosen interactively" "$(grep '^addons=' "$PLAT/firestick_cleanup_10.0.0.9.state")" "addons="
 

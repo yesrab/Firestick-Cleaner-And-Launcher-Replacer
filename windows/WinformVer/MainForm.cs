@@ -6,9 +6,12 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography;
+using System.Security.Cryptography.Pkcs;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 namespace FirestickCleanup
@@ -23,12 +26,29 @@ namespace FirestickCleanup
         private const string Version = "2.0.0";
         private const string DeviceTmp = "/data/local/tmp";
         private const string StockLauncher = "com.amazon.tv.launcher";
+        // APKMirror serves app metadata (versions, variants, signing certs) to the open-source APKUpdater
+        // app through this endpoint; the key ships inside that app. APKMirror does not allow scripted
+        // file downloads, so the download itself happens in the user's browser.
+        private const string ApkMirrorApi = "https://www.apkmirror.com/wp-json/apkm/v1/app_exists/";
+        private const string ApkMirrorAuth = "Basic YXBpLWFwa3VwZGF0ZXI6cm01cmNmcnVVakt5MDRzTXB5TVBKWFc4";
 
         private readonly string baseDir;
         private readonly string adbPath;
         private readonly string logFile;
         private readonly string lastIpFile;
         private readonly string downloadDir;
+        private readonly string downloadsWatch;
+
+        // Device facts read after connecting; used to pick matching APK variants.
+        private int devSdk;
+        private string devAbis = "", devRelease = "", devFireOs = "", devModel = "";
+        private string expectedVCode = "";
+
+        private sealed class ApkMirrorVariant
+        {
+            public string Version, VCode, Arches, Sha, Page;
+            public int MinApi;
+        }
 
         private List<GroupDef> groups = new List<GroupDef>();
         private List<AppDef> apps = new List<AppDef>();
@@ -55,6 +75,7 @@ namespace FirestickCleanup
             logFile = Path.Combine(baseDir, "firestick_cleanup_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".log");
             lastIpFile = Path.Combine(baseDir, ".last_ip");
             downloadDir = Path.Combine(baseDir, "downloads");
+            downloadsWatch = FindDownloadsFolder();
             Load += MainForm_Load;
         }
 
@@ -183,6 +204,31 @@ namespace FirestickCleanup
             await RunGuarded(RunStatusAsync);
         }
 
+        private async void BtnTestBoot_Click(object sender, EventArgs e)
+        {
+            if (!StartRun()) return;
+            await RunGuarded(RunTestBootAsync);
+        }
+
+        private async Task RunTestBootAsync()
+        {
+            var launcher = apps.FirstOrDefault(a => a.Key == state.Get("launcher"));
+            if (launcher == null) { Log("[!!] No saved state for this device; run Install + Clean first."); return; }
+            SetProgress(0, "Connecting...");
+            if (!await ConnectAsync()) return;
+            SetProgress(20, "Rebooting...");
+            if (!await RebootAndReconnectAsync()) { Log("  [!!] Could not reconnect after reboot."); return; }
+            int reapplied = await ReapplyDisabledAsync();
+            Log(reapplied > 0 ? $"  [OK] Re-disabled {reapplied} packages that came back after the reboot" : "  [OK] All packages stayed disabled after the reboot");
+            var addons = state.Get("addons").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(k => apps.FirstOrDefault(a => a.Key == k)).Where(a => a != null).ToList();
+            SetProgress(60, "Verifying...");
+            await VerifyAppAsync(launcher);
+            foreach (var addon in addons) await VerifyAppAsync(addon);
+            await VerifyBootAsync(launcher, addons);
+            SetProgress(100, "Boot test complete.");
+        }
+
         private async void BtnRevert_Click(object sender, EventArgs e)
         {
             if (!StartRun()) return;
@@ -243,6 +289,7 @@ namespace FirestickCleanup
             await VerifyAppAsync(c.Launcher);
             foreach (var addon in addons) await VerifyAppAsync(addon);
             Log($"  [OK] {(await DisabledNowAsync()).Count} packages are disabled on the device");
+            await VerifyBootAsync(c.Launcher, addons);
 
             var after = await CaptureMemAsync();
             int freed = after.avail - before.avail;
@@ -305,7 +352,7 @@ namespace FirestickCleanup
             if (!await ConnectAsync()) return;
             SetProgress(50, "Reading device state...");
             string acc = (await DshAsync("settings", "get", "secure", "enabled_accessibility_services")).Trim();
-            string role = (await DshAsync("cmd", "role", "get-role-holders", "android.app.role.HOME")).Trim();
+            string role = await HomeRoleHolderAsync();
             var disabled = await DisabledNowAsync();
             foreach (var app in apps)
             {
@@ -400,6 +447,7 @@ namespace FirestickCleanup
                     {
                         Log($"  [OK] Connected to {target}");
                         try { File.WriteAllText(lastIpFile, ip); } catch { }
+                        await ReadDeviceInfoAsync();
                         return true;
                     }
                 }
@@ -416,6 +464,34 @@ namespace FirestickCleanup
             return false;
         }
 
+        private async Task ReadDeviceInfoAsync()
+        {
+            var sdk = Regex.Replace(await DshAsync("getprop", "ro.build.version.sdk"), @"\D", "");
+            int.TryParse(sdk, out devSdk);
+            devRelease = (await DshAsync("getprop", "ro.build.version.release")).Trim();
+            devFireOs = (await DshAsync("getprop", "ro.build.version.fireos")).Trim();
+            devAbis = (await DshAsync("getprop", "ro.product.cpu.abilist")).Trim();
+            if (devAbis.Length == 0) devAbis = (await DshAsync("getprop", "ro.product.cpu.abi")).Trim();
+            devModel = (await DshAsync("getprop", "ro.product.model")).Trim();
+            Log($"  [OK] Device: {(devModel.Length > 0 ? devModel : "unknown model")}, Fire OS {(devFireOs.Length > 0 ? devFireOs : "?")} (Android {(devRelease.Length > 0 ? devRelease : "?")}, API {devSdk}), CPU: {(devAbis.Length > 0 ? devAbis : "?")}");
+        }
+
+        private static string FindDownloadsFolder()
+        {
+            var env = Environment.GetEnvironmentVariable("FSC_DOWNLOADS_DIR");
+            if (!string.IsNullOrEmpty(env)) return env;
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"))
+                {
+                    var v = key?.GetValue("{374DE290-123F-4565-9164-39C4925E467B}") as string;
+                    if (!string.IsNullOrEmpty(v)) return v;
+                }
+            }
+            catch { }
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+        }
+
         private async Task<string> DeviceStateAsync()
         {
             var (_, output) = await RunAdb("devices");
@@ -429,17 +505,38 @@ namespace FirestickCleanup
 
         private async Task<bool> RebootAndReconnectAsync()
         {
+            // The package manager persists package state asynchronously; rebooting straight after
+            // a batch of pm commands loses the last few changes.
+            Log("  [..] Letting the Fire TV save its package state...");
+            await Task.Delay(15000);
+            // Best effort: ask Fire OS to keep ADB debugging enabled across the reboot.
+            await DshAsync("settings", "put", "global", "adb_enabled", "1");
+            await DshAsync("settings", "put", "global", "adb_wifi_enabled", "1");
             Log("  [..] Rebooting Fire TV...");
             await DshAsync("reboot");
             await Task.Delay(20000);
+            if (await WaitForDeviceAsync(180)) { Log("  [OK] Device is back online"); return true; }
+            // Some Fire OS builds switch ADB debugging off at boot; let the user turn it back on.
+            while (true)
+            {
+                Log("  [--] The Fire TV did not come back on ADB. Fire OS can switch ADB Debugging off at boot.");
+                if (!Confirm("The Fire TV did not come back on ADB. Fire OS can switch ADB Debugging off at boot.\n\n" +
+                             "On the TV: Settings > My Fire TV > Developer Options > ADB Debugging > ON\n" +
+                             "(then accept the 'Allow USB debugging' prompt again if it appears)\n\n" +
+                             "Click OK once ADB Debugging is on again to reconnect.", "ADB is off")) return false;
+                if (await WaitForDeviceAsync(120)) { Log("  [OK] Device is back online"); return true; }
+            }
+        }
+
+        private async Task<bool> WaitForDeviceAsync(int timeoutSeconds)
+        {
             var sw = Stopwatch.StartNew();
-            while (sw.Elapsed.TotalSeconds < 180)
+            while (sw.Elapsed.TotalSeconds < timeoutSeconds)
             {
                 await RunAdb("connect", target);
                 if (await DeviceStateAsync() == "device" && (await DshAsync("echo", "fsc_ok")).Contains("fsc_ok"))
                 {
                     await Task.Delay(5000);
-                    Log("  [OK] Device is back online");
                     return true;
                 }
                 await Task.Delay(2000);
@@ -494,6 +591,7 @@ namespace FirestickCleanup
         // ------------------------------------------------------------
         private async Task<string> FetchApkAsync(AppDef app)
         {
+            expectedVCode = "";
             foreach (var glob in app.ApkGlobs)
             {
                 var local = Directory.GetFiles(baseDir, glob).FirstOrDefault();
@@ -507,6 +605,7 @@ namespace FirestickCleanup
                 ShowMessage($"{app.Name} is not bundled and cannot be downloaded automatically.\n\nDownload it from {app.Source.Substring(7)} and save it in:\n{baseDir}\n\nAccepted file names: {string.Join(" ", app.ApkGlobs)}", "APK needed");
                 return null;
             }
+            if (app.Source.StartsWith("apkmirror:")) return await FetchApkMirrorAsync(app, app.Source.Substring(10));
             if (!app.Source.StartsWith("github:")) { Log("  [!!] Unknown source for " + app.Name); return null; }
 
             Log($"  [..] Fetching latest {app.Name} release from GitHub...");
@@ -518,15 +617,27 @@ namespace FirestickCleanup
                 {
                     http.DefaultRequestHeaders.UserAgent.ParseAdd("firestick-cleanup/" + Version);
                     string json = await http.GetStringAsync("https://api.github.com/repos/" + app.Source.Substring(7) + "/releases/latest");
-                    var urls = Regex.Matches(json, @"""browser_download_url"":\s*""([^""]+\.apk)""").Cast<Match>().Select(m => m.Groups[1].Value).ToList();
-                    if (urls.Count > 0)
+                    var rel = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
+                    var assets = (rel["assets"] as System.Collections.ArrayList ?? new System.Collections.ArrayList())
+                        .Cast<Dictionary<string, object>>().ToList();
+                    string pattern = app.AssetMatch.Length > 0 ? app.AssetMatch : "*.apk";
+                    var cands = pattern.Contains("{abi}")
+                        ? AbiCandidates().Select(a => pattern.Replace("{abi}", a)).ToList()
+                        : new List<string> { pattern };
+                    foreach (var c in cands)
                     {
-                        url = urls[0];
-                        if (urls.Count == 1)
+                        var re = GlobToRegex(c);
+                        var a = assets.FirstOrDefault(x => x.ContainsKey("name") && re.IsMatch(x["name"].ToString()));
+                        if (a == null) continue;
+                        url = a["browser_download_url"].ToString();
+                        object dg;
+                        if (a.TryGetValue("digest", out dg) && dg != null)
                         {
-                            var d = Regex.Match(json, @"""digest"":\s*""sha256:([0-9a-f]+)""");
+                            var d = Regex.Match(dg.ToString(), @"^sha256:([0-9a-f]+)$");
                             if (d.Success) sha = d.Groups[1].Value;
                         }
+                        Log("  [..] Release asset: " + a["name"]);
+                        break;
                     }
                 }
             }
@@ -574,6 +685,187 @@ namespace FirestickCleanup
             return apk;
         }
 
+        private IEnumerable<string> AbiCandidates()
+        {
+            foreach (var a in devAbis.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) yield return a.Trim();
+            yield return "universal";
+        }
+
+        private static Regex GlobToRegex(string glob) =>
+            new Regex("^" + Regex.Escape(glob).Replace(@"\*", ".*").Replace(@"\?", ".") + "$", RegexOptions.IgnoreCase);
+
+        /// <summary>Asks APKMirror's metadata API for the newest variant that fits this device.</summary>
+        private async Task<ApkMirrorVariant> ApkMirrorLookupAsync(string pkg)
+        {
+            string json;
+            try
+            {
+                var fixture = Environment.GetEnvironmentVariable("FSC_APKMIRROR_JSON");
+                if (!string.IsNullOrEmpty(fixture)) json = File.ReadAllText(fixture);
+                else
+                {
+                    ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+                    using (var http = new HttpClient())
+                    {
+                        http.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", ApkMirrorAuth);
+                        http.DefaultRequestHeaders.UserAgent.ParseAdd("APKUpdater-v3.0.3");
+                        var body = new StringContent("{\"pnames\":[\"" + pkg + "\"]}", Encoding.UTF8, "application/json");
+                        using (var resp = await http.PostAsync(ApkMirrorApi, body))
+                        {
+                            resp.EnsureSuccessStatusCode();
+                            json = await resp.Content.ReadAsStringAsync();
+                        }
+                    }
+                }
+                var root = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Deserialize<Dictionary<string, object>>(json);
+                var data = (root["data"] as System.Collections.ArrayList ?? new System.Collections.ArrayList()).Cast<Dictionary<string, object>>();
+                var item = data.FirstOrDefault(d => d.ContainsKey("pname") && d["pname"].ToString() == pkg);
+                if (item == null || !(item["exists"] is bool) || !(bool)item["exists"]) return null;
+                var abis = AbiCandidates().ToList();
+                Dictionary<string, object> best = null;
+                int bestScore = -1;
+                foreach (var a in (item["apks"] as System.Collections.ArrayList ?? new System.Collections.ArrayList()).Cast<Dictionary<string, object>>())
+                {
+                    int minapi; int.TryParse(a["minapi"].ToString(), out minapi);
+                    if (devSdk > 0 && minapi > devSdk) continue;
+                    var arches = (a["arches"] as System.Collections.ArrayList ?? new System.Collections.ArrayList()).Cast<object>().Select(x => x.ToString()).ToList();
+                    bool fits = arches.Count == 0; int arm64 = 0;
+                    foreach (var ar in arches)
+                    {
+                        if (ar == "universal" || ar == "noarch" || abis.Contains(ar)) { fits = true; if (ar == "arm64-v8a") arm64 = 1; }
+                    }
+                    if (!fits) continue;
+                    var dpis = (a["dpis"] as System.Collections.ArrayList ?? new System.Collections.ArrayList()).Cast<object>().Select(x => x.ToString());
+                    int score = minapi * 10 + arm64 * 5 + (dpis.Contains("nodpi") ? 1 : 0);
+                    if (score > bestScore) { bestScore = score; best = a; }
+                }
+                if (best == null) return null;
+                var release = item["release"] as Dictionary<string, object>;
+                var shas = best.ContainsKey("signatures-sha256") ? best["signatures-sha256"] as System.Collections.ArrayList : null;
+                int bestMin; int.TryParse(best["minapi"].ToString(), out bestMin);
+                return new ApkMirrorVariant
+                {
+                    Version = release != null && release.ContainsKey("version") ? release["version"].ToString() : "",
+                    VCode = best["version_code"].ToString(),
+                    MinApi = bestMin,
+                    Arches = string.Join(",", (best["arches"] as System.Collections.ArrayList ?? new System.Collections.ArrayList()).Cast<object>()),
+                    Sha = shas != null && shas.Count > 0 ? shas[0].ToString() : "",
+                    Page = "https://www.apkmirror.com" + best["link"]
+                };
+            }
+            catch (Exception ex) { Log("  [--] APKMirror lookup failed: " + ex.Message); return null; }
+        }
+
+        /// <summary>Browser-assisted APKMirror download: opens the matching variant page and waits for the file.</summary>
+        private async Task<string> FetchApkMirrorAsync(AppDef app, string pkg)
+        {
+            expectedVCode = "";
+            Log($"  [..] Looking up {app.Name} on APKMirror for Android API {devSdk} ({(devAbis.Length > 0 ? devAbis : "unknown CPU")})...");
+            var v = await ApkMirrorLookupAsync(pkg);
+            string page;
+            if (v != null)
+            {
+                Log($"  [OK] Latest: {app.Name} {v.Version} (build {v.VCode}, min API {v.MinApi}, {v.Arches})");
+                page = v.Page;
+                Directory.CreateDirectory(downloadDir);
+                var cached = Directory.GetFiles(downloadDir, pkg + "_*.apk")
+                    .FirstOrDefault(f => Path.GetFileName(f).Contains("-" + v.VCode + "_") || Path.GetFileName(f).EndsWith("-" + v.VCode + ".apk"));
+                if (cached != null) { expectedVCode = v.VCode; Log("  [OK] Already downloaded: " + Path.GetFileName(cached)); return cached; }
+            }
+            else
+            {
+                Log($"  [--] Could not query APKMirror; pick a version yourself (min Android API {devSdk} or lower).");
+                page = app.Page;
+                if (page.Length == 0) { Log("  [!!] No APKMirror page configured for " + app.Name); return null; }
+            }
+            ShowMessage(
+                "APKMirror does not let programs download files, so your browser will open on the download page for " +
+                app.Name + (v != null ? " " + v.Version : "") + " that matches this Fire TV.\n\n" +
+                "Click DOWNLOAD APK there (and the 'here' link if nothing starts).\n\n" +
+                "This window keeps watching " + downloadsWatch + " and continues automatically once the file arrives.",
+                "One click needed in your browser");
+            var since = DateTime.Now;
+            try { Process.Start(page); } catch (Exception ex) { Log("  [--] Could not open the browser (" + ex.Message + "). Open this URL yourself: " + page); }
+            SetStatus("Waiting for the APK to appear in " + downloadsWatch + "...");
+            string found = await WaitForDownloadAsync(pkg, since, TimeSpan.FromMinutes(15));
+            if (found == null) { Log($"  [!!] No {pkg}_*.apk appeared within 15 minutes. Save it in {baseDir} and run again."); return null; }
+            Directory.CreateDirectory(downloadDir);
+            string apk = Path.Combine(downloadDir, Path.GetFileName(found));
+            if (!string.Equals(found, apk, StringComparison.OrdinalIgnoreCase))
+            {
+                if (File.Exists(apk)) File.Delete(apk);
+                File.Move(found, apk);
+            }
+            Log($"  [OK] Got {Path.GetFileName(apk)} ({HumanSize(new FileInfo(apk).Length)})");
+            if (!VerifyApk(apk, v != null ? v.Sha : "")) return null;
+            if (v != null) expectedVCode = v.VCode;
+            return apk;
+        }
+
+        private async Task<string> WaitForDownloadAsync(string pkg, DateTime since, TimeSpan timeout)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed < timeout)
+            {
+                foreach (var dir in new[] { downloadsWatch, baseDir })
+                {
+                    string f = null;
+                    try { f = Directory.Exists(dir) ? Directory.GetFiles(dir, pkg + "_*.apk").FirstOrDefault(x => File.GetLastWriteTime(x) > since) : null; } catch { }
+                    if (f == null) continue;
+                    long size1 = new FileInfo(f).Length;
+                    await Task.Delay(2000);
+                    long size2 = new FileInfo(f).Length;
+                    if (size1 == size2 && size1 > 100000 && !File.Exists(f + ".crdownload") && !File.Exists(f + ".part")) return f;
+                }
+                await Task.Delay(2000);
+            }
+            return null;
+        }
+
+        /// <summary>Checks the zip magic and, when a v1 signature is present, the signing certificate's SHA-256.</summary>
+        private bool VerifyApk(string file, string wantSha)
+        {
+            try
+            {
+                using (var fs = File.OpenRead(file))
+                {
+                    if (fs.Length < 2 || fs.ReadByte() != 0x50 || fs.ReadByte() != 0x4B) { Log($"  [!!] {Path.GetFileName(file)} is not an APK (not a zip file)."); return false; }
+                }
+            }
+            catch (Exception ex) { Log("  [!!] Cannot read " + file + ": " + ex.Message); return false; }
+            if (string.IsNullOrEmpty(wantSha)) return true;
+            string got = ApkV1CertSha256(file);
+            if (got == null) { Log("  [..] APK has no readable v1 signature block; the signing certificate cannot be checked here."); return true; }
+            if (got != wantSha) { Log($"  [!!] Signing certificate mismatch (expected {wantSha}, got {got}). Refusing to install."); return false; }
+            Log("  [OK] Signing certificate matches APKMirror's record for this app");
+            return true;
+        }
+
+        private static string ApkV1CertSha256(string file)
+        {
+            try
+            {
+                using (var zip = System.IO.Compression.ZipFile.OpenRead(file))
+                {
+                    var entry = zip.Entries.FirstOrDefault(e => Regex.IsMatch(e.FullName, @"^META-INF/[^/]+\.(RSA|DSA|EC)$", RegexOptions.IgnoreCase));
+                    if (entry == null) return null;
+                    using (var st = entry.Open())
+                    using (var ms = new MemoryStream())
+                    {
+                        st.CopyTo(ms);
+                        var cms = new SignedCms();
+                        cms.Decode(ms.ToArray());
+                        X509Certificate2 cert = cms.SignerInfos.Count > 0 ? cms.SignerInfos[0].Certificate : null;
+                        if (cert == null && cms.Certificates.Count > 0) cert = cms.Certificates[0];
+                        if (cert == null) return null;
+                        using (var sha = SHA256.Create())
+                            return BitConverter.ToString(sha.ComputeHash(cert.RawData)).Replace("-", "").ToLowerInvariant();
+                    }
+                }
+            }
+            catch { return null; }
+        }
+
         private async Task<bool> InstallApkAsync(AppDef app, string apk)
         {
             if (await IsInstalledAsync(app.Package)) Log($"  [..] {app.Name} is already installed; updating in place.");
@@ -586,6 +878,14 @@ namespace FirestickCleanup
             if (!inst.Contains("Success")) { Log("  [!!] Install failed: " + inst); return false; }
             if (!await IsInstalledAsync(app.Package)) { Log($"  [!!] Install reported success but {app.Package} is not on the device."); return false; }
             Log($"  [OK] {app.Name} installed");
+            if (expectedVCode.Length > 0)
+            {
+                var m = Regex.Match(await DshAsync("dumpsys", "package", app.Package), @"versionCode=(\d+)");
+                if (m.Success)
+                    Log(m.Groups[1].Value == expectedVCode ? $"  [OK] Installed build {m.Groups[1].Value}"
+                                                           : $"  [--] Installed build {m.Groups[1].Value} differs from the expected build {expectedVCode}");
+                expectedVCode = "";
+            }
             state.AddUnique("installed", app.Package);
             return true;
         }
@@ -610,10 +910,14 @@ namespace FirestickCleanup
                 await EnableSecureListAsync("enabled_notification_listeners", app.NotificationListener, app.Package);
                 Log("  [OK] Notification listener enabled");
             }
+            foreach (var op in app.AppOps)
+            {
+                await DshAsync("appops", "set", app.Package, op, "allow");
+                Log("  [OK] App op " + op + " allowed");
+            }
+            if (app.StartsAtBoot) await PrepareBootAsync(app);
             if (app.IsLauncher)
             {
-                await DshAsync("appops", "set", app.Package, "SYSTEM_ALERT_WINDOW", "allow");
-                Log("  [OK] Overlay permission granted");
                 await DshAsync("cmd", "role", "add-role-holder", "android.app.role.HOME", app.Package);
                 Log("  [OK] HOME role assigned");
                 await DshAsync("cmd", "package", "set-home-activity", "--user", "0", app.Activity);
@@ -657,6 +961,75 @@ namespace FirestickCleanup
             }
         }
 
+        /// <summary>Keeps an app's boot receiver and accessibility service from being throttled. Best effort per firmware.</summary>
+        private async Task PrepareBootAsync(AppDef app)
+        {
+            await DshAsync("dumpsys", "deviceidle", "whitelist", "+" + app.Package);
+            await DshAsync("appops", "set", app.Package, "RUN_IN_BACKGROUND", "allow");
+            await DshAsync("appops", "set", app.Package, "RUN_ANY_IN_BACKGROUND", "allow");
+            await DshAsync("am", "set-standby-bucket", app.Package, "active");
+            if ((await DshAsync("dumpsys", "deviceidle", "whitelist")).Contains(app.Package)) Log("  [OK] Allowed to run at boot and in the background");
+            else Log($"  [..] Could not add {app.Package} to the doze whitelist (not supported on this firmware)");
+        }
+
+        /// <summary>Package holding the HOME role. Android 12+ has get-role-holders; older firmware is asked who resolves HOME.</summary>
+        private async Task<string> HomeRoleHolderAsync()
+        {
+            string out = (await DshAsync("cmd", "role", "get-role-holders", "android.app.role.HOME")).Trim();
+            if (out.Length == 0 || Regex.IsMatch(out, "Unknown command|Error|Exception"))
+            {
+                // Android 11: read the role dump ("name=android.app.role.HOME" then "holders=pkg").
+                out = "";
+                bool found = false;
+                foreach (var l in (await DshAsync("dumpsys", "role")).Split('\n'))
+                {
+                    if (Regex.IsMatch(l, @"name=android\.app\.role\.HOME\s*$")) { found = true; continue; }
+                    if (!found) continue;
+                    var m = Regex.Match(l, "holders=(.*)$");
+                    if (m.Success) { out = m.Groups[1].Value.Trim(); break; }
+                }
+            }
+            return Regex.Replace(out.Split('\n')[0], "[/;,].*$", "");
+        }
+
+        private async Task<string> ForegroundPackageAsync()
+        {
+            string line = await DshAsync("dumpsys window 2>/dev/null | grep -m1 mCurrentFocus");
+            if (line.Trim().Length == 0) line = await DshAsync("dumpsys activity activities 2>/dev/null | grep -m1 mResumedActivity");
+            var m = Regex.Match(line, @" u\d+ ([A-Za-z0-9_.]+)/");
+            return m.Success ? m.Groups[1].Value : "";
+        }
+
+        /// <summary>After the reboot: waits for boot, checks the launcher and boot add-ons are running, tests the Home redirect.</summary>
+        private async Task VerifyBootAsync(AppDef launcher, IEnumerable<AppDef> addons)
+        {
+            Log("");
+            Log("=== Checking what starts at boot ===");
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed.TotalSeconds < 90 && Regex.Replace(await DshAsync("getprop", "sys.boot_completed"), @"\D", "") != "1") await Task.Delay(3000);
+            await Task.Delay(10000);
+            foreach (var app in new[] { launcher }.Concat(addons))
+            {
+                if (!app.StartsAtBoot) continue;
+                var c = Regex.Match(await DshAsync("(ps -A 2>/dev/null || ps) | grep -c " + app.Package), @"\d+");
+                int n; int.TryParse(c.Success ? c.Value : "0", out n);
+                Log(n > 0 ? $"  [OK] {app.Name} is running after boot" : $"  [--] {app.Name} is not running after boot");
+            }
+            string fg = await ForegroundPackageAsync();
+            if (fg == launcher.Package) { Log($"  [OK] On screen after boot: {launcher.Name}"); return; }
+            Log($"  [..] On screen after boot: {(fg.Length > 0 ? fg : "unknown")}. Pressing Home to test the redirect...");
+            await DshAsync("input", "keyevent", "3");
+            await Task.Delay(7000);
+            fg = await ForegroundPackageAsync();
+            if (fg == launcher.Package) Log($"  [OK] After pressing Home: {launcher.Name} takes over");
+            else
+            {
+                Log($"  [--] After pressing Home: {(fg.Length > 0 ? fg : "unknown")} is still in front.");
+                Log("      On the TV, check: Home on Fire > 'Choose target app' is set and 'Launch on boot' is on;");
+                Log("      Projectivy > Settings > General > 'Override current launcher' (OFF if you use Home on Fire).");
+            }
+        }
+
         private async Task<bool> SetupAppAsync(AppDef app)
         {
             Log("");
@@ -673,6 +1046,22 @@ namespace FirestickCleanup
         private async Task VerifyAppAsync(AppDef app)
         {
             Log(await IsInstalledAsync(app.Package) ? $"  [OK] {app.Name} is installed" : $"  [!!] {app.Name} is NOT installed");
+            foreach (var perm in app.Grants)
+            {
+                string shortName = perm.Substring(perm.LastIndexOf('.') + 1);
+                if ((await DshAsync("dumpsys", "package", app.Package)).Contains(perm + ": granted=true")) { Log($"  [OK] {app.Name} has {shortName}"); continue; }
+                // Grants made shortly before a reboot can be lost; grant again and re-check.
+                await DshAsync("pm", "grant", app.Package, perm);
+                if ((await DshAsync("dumpsys", "package", app.Package)).Contains(perm + ": granted=true"))
+                    Log($"  [OK] {app.Name} has {shortName} (granted again; the first grant did not persist)");
+                else if (perm == "android.permission.WRITE_SECURE_SETTINGS" && app.Accessibility.Length > 0)
+                {
+                    Log($"  [--] {shortName} cannot be granted on this firmware.");
+                    Log("      Not a problem: the accessibility service was enabled directly over adb instead;");
+                    Log("      only the app's own in-app accessibility toggle needs that permission.");
+                }
+                else Log($"  [!!] {app.Name} is missing {shortName} (grant it with: adb shell pm grant {app.Package} {perm})");
+            }
             if (app.Accessibility.Length > 0)
             {
                 bool on = (await DshAsync("settings", "get", "secure", "enabled_accessibility_services")).Contains(app.Package);
@@ -680,7 +1069,7 @@ namespace FirestickCleanup
             }
             if (app.IsLauncher)
             {
-                bool role = (await DshAsync("cmd", "role", "get-role-holders", "android.app.role.HOME")).Contains(app.Package);
+                bool role = (await HomeRoleHolderAsync()) == app.Package;
                 Log(role ? $"  [OK] {app.Name} holds the HOME role" : $"  [--] {app.Name} does not hold the HOME role (expected on some firmware; the Home-button service still works)");
             }
         }
@@ -894,7 +1283,7 @@ namespace FirestickCleanup
         private void SetButtons(bool enabled)
         {
             if (btnStart.InvokeRequired) { btnStart.BeginInvoke((Action)(() => SetButtons(enabled))); return; }
-            btnStart.Enabled = btnReapply.Enabled = btnStatus.Enabled = btnRevert.Enabled = enabled;
+            btnStart.Enabled = btnReapply.Enabled = btnStatus.Enabled = btnTestBoot.Enabled = btnRevert.Enabled = enabled;
             txtDeviceIP.Enabled = cmbLauncher.Enabled = pnlAddons.Enabled = grpOptions.Enabled = enabled;
         }
 

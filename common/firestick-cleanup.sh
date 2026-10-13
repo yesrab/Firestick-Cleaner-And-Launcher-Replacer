@@ -19,6 +19,13 @@ LAUNCHERS_CONF="$COMMON_DIR/launchers.conf"
 DOWNLOAD_DIR="$PLATFORM_DIR/downloads"
 LAST_IP_FILE="$PLATFORM_DIR/.last_ip"
 DEVICE_TMP="/data/local/tmp"
+# Folder your browser saves downloads to (override with FSC_DOWNLOADS_DIR).
+DOWNLOADS_WATCH="${FSC_DOWNLOADS_DIR:-$HOME/Downloads}"
+# APKMirror serves app metadata (versions, variants, signing certs) to the open-source
+# APKUpdater app through this endpoint; the key below ships inside that app. APKMirror
+# does not allow scripted file downloads, so the download itself happens in your browser.
+APKMIRROR_API="https://www.apkmirror.com/wp-json/apkm/v1/app_exists/"
+APKMIRROR_AUTH="Basic YXBpLWFwa3VwZGF0ZXI6cm01cmNmcnVVakt5MDRzTXB5TVBKWFc4"
 
 MODE="install"          # install | revert | reapply | status | dry-run
 FIRE_IP=""
@@ -33,6 +40,8 @@ ADB=""
 TARGET=""
 STATE_FILE=""
 LOGFILE=""
+DEV_SDK=0; DEV_ABIS=""; DEV_RELEASE=""; DEV_FIREOS=""; DEV_MODEL=""
+EXPECTED_VCODE=""
 if [ -t 1 ]; then CURL_PROGRESS="--progress-bar"; else CURL_PROGRESS="-sS"; fi
 
 # ------------------------------------------------------------
@@ -49,11 +58,13 @@ Modes (default: full install)
   --reapply           Re-disable packages using the saved choices (after a Fire OS update)
   --status            Show launcher, Home on Fire and disabled-package state; change nothing
   --dry-run           Show what would be done; change nothing
+  --test-boot         Reboot the Fire TV and check the launcher and add-ons come up (after you
+                      finished the on-TV steps, or any time you want a cold-boot check)
 
 Options
   --ip <ip[:port]>    Fire TV address (skips the prompt)
   --launcher <key>    projectivy | at4k | couchy   (default: projectivy)
-  --with <a,b,..>     Add-ons to install: homeonfire, youtubetv (see launchers.conf)
+  --with <a,b,..>     Add-ons: homeonfire, youtubetv, googleapp, smarttube (see launchers.conf)
   --without <a,b,..>  Add-ons to skip
   --home-on-fire      Same as --with homeonfire      --no-home-on-fire: --without homeonfire
   --disable <a,b,..>  Optional groups to disable, comma-separated (see packages.conf)
@@ -76,6 +87,7 @@ while [ $# -gt 0 ]; do
         --reapply)  MODE=reapply ;;
         --status)   MODE=status ;;
         --dry-run)  MODE=dry-run ;;
+        --test-boot) MODE=test-boot ;;
         --ip)       FIRE_IP="${2:-}"; shift ;;
         --ip=*)     FIRE_IP="${1#--ip=}" ;;
         --launcher) LAUNCHER_KEY="${2:-}"; shift ;;
@@ -323,7 +335,18 @@ connect_device() {
     return 1
 }
 
+# Best effort: ask Fire OS to keep ADB debugging enabled across the reboot.
+keep_adb_on() {
+    dsh settings put global adb_enabled 1 >/dev/null
+    dsh settings put global adb_wifi_enabled 1 >/dev/null
+}
+
 reboot_and_reconnect() {
+    # The package manager persists package state asynchronously; rebooting straight after
+    # a batch of pm commands loses the last few changes.
+    info "Letting the Fire TV save its package state..."
+    sleep 15
+    keep_adb_on
     info "Rebooting Fire TV..."
     adbt shell reboot >/dev/null 2>&1
     sleep 20
@@ -332,7 +355,32 @@ reboot_and_reconnect() {
         ok "Device is back online"
         return 0
     fi
-    return 1
+    # Some Fire OS builds switch ADB debugging off at boot; let the user turn it back on.
+    while :; do
+        warn "The Fire TV did not come back on ADB. Fire OS can switch ADB Debugging off at boot."
+        say "      On the TV: Settings > My Fire TV > Developer Options > ADB Debugging > ON"
+        say "      (then accept the 'Allow USB debugging' prompt again if it appears)"
+        if [ "$NONINTERACTIVE" -eq 1 ]; then
+            info "Waiting up to 5 more minutes for ADB to come back..."
+            if wait_for_device 300; then sleep 5; ok "Device is back online"; return 0; fi
+            return 1
+        fi
+        yesno "ADB Debugging is on again; try to reconnect?" y || return 1
+        if wait_for_device 120; then sleep 5; ok "Device is back online"; return 0; fi
+    done
+}
+
+# Reads Android/Fire OS version and CPU ABIs; used to pick matching APK variants.
+read_device_info() {
+    DEV_SDK="$(dsh getprop ro.build.version.sdk | tr -dc '0-9')"
+    DEV_SDK="${DEV_SDK:-0}"
+    DEV_RELEASE="$(dsh getprop ro.build.version.release | tr -d ' ')"
+    DEV_FIREOS="$(dsh getprop ro.build.version.fireos | tr -d ' ')"
+    DEV_ABIS="$(dsh getprop ro.product.cpu.abilist | tr -d ' ')"
+    [ -n "$DEV_ABIS" ] || DEV_ABIS="$(dsh getprop ro.product.cpu.abi | tr -d ' ')"
+    DEV_MODEL="$(dsh getprop ro.product.model)"
+    ok "Device: ${DEV_MODEL:-unknown model}, Fire OS ${DEV_FIREOS:-?} (Android ${DEV_RELEASE:-?}, API $DEV_SDK), CPU: ${DEV_ABIS:-?}"
+    log "[DEVICE] sdk=$DEV_SDK release=$DEV_RELEASE fireos=$DEV_FIREOS abis=$DEV_ABIS model=$DEV_MODEL"
 }
 
 # Sets MEM_TOTAL, MEM_AVAIL (MB) and PROCS (Amazon process count).
@@ -388,18 +436,200 @@ sha256_of() {
     else echo ""; fi
 }
 
-# gh_latest owner/repo -> sets GH_URL and GH_SHA (sha may be empty)
-gh_latest() {
-    local json urls
-    json="$(curl -fsSL -H 'User-Agent: firestick-cleanup' "https://api.github.com/repos/$1/releases/latest" 2>/dev/null)" || return 1
-    urls="$(printf '%s' "$json" | grep -o '"browser_download_url": *"[^"]*\.apk"' | sed 's/.*"\(https[^"]*\)"/\1/')"
-    GH_URL="$(printf '%s\n' "$urls" | head -1)"
-    [ -n "$GH_URL" ] || return 1
-    GH_SHA=""
-    if [ "$(printf '%s\n' "$urls" | grep -c .)" -eq 1 ]; then
-        GH_SHA="$(printf '%s' "$json" | grep -o '"digest": *"sha256:[0-9a-f]*"' | head -1 | sed 's/.*sha256:\([0-9a-f]*\)".*/\1/')"
+sha256_stdin() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | awk '{print $1}'
+    else cat >/dev/null; echo ""; fi
+}
+
+filesize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
+
+# verify_apk <file> [expected signing-cert sha256]
+# Checks the file is a zip and, when the APK carries a v1 signature, that the signing
+# certificate matches. Android itself verifies the signature again on install.
+verify_apk() {
+    local f="$1" want="${2:-}" entry got
+    if [ "$(head -c 2 "$f" 2>/dev/null)" != "PK" ]; then
+        err "$(basename "$f") is not an APK (not a zip file)."
+        return 1
     fi
-    return 0
+    [ -n "$want" ] || return 0
+    entry="$(unzip -Z1 "$f" 2>/dev/null | grep -iE '^META-INF/[^/]*\.(RSA|DSA|EC)$' | head -1)"
+    if [ -z "$entry" ]; then
+        info "APK has no v1 signature block; the signing certificate cannot be checked here."
+        return 0
+    fi
+    got="$(unzip -p "$f" "$entry" 2>/dev/null | openssl pkcs7 -inform DER -print_certs 2>/dev/null \
+        | openssl x509 -outform DER 2>/dev/null | sha256_stdin)"
+    if [ -z "$got" ]; then
+        info "Could not read the signing certificate; skipping the check."
+        return 0
+    fi
+    if [ "$got" != "$want" ]; then
+        err "Signing certificate mismatch (expected $want, got $got). Refusing to install."
+        return 1
+    fi
+    ok "Signing certificate matches APKMirror's record for this app"
+}
+
+open_url() {
+    if [ -n "${FSC_BROWSER:-}" ]; then
+        "$FSC_BROWSER" "$1" >/dev/null 2>&1 &
+        return 0
+    fi
+    case "$(uname)" in
+        Darwin) open "$1" ;;
+        *) xdg-open "$1" >/dev/null 2>&1 || say "  Open this URL in a browser: $1" ;;
+    esac
+}
+
+# wait_for_download <package> <marker-file> <timeout-s>
+# Prints the path of a new, complete <package>_*.apk in the watched folders.
+wait_for_download() {
+    local pkg="$1" marker="$2" timeout="$3" waited=0 f size1 size2
+    while [ "$waited" -lt "$timeout" ]; do
+        f="$(find "$DOWNLOADS_WATCH" "$PLATFORM_DIR" -maxdepth 1 -name "${pkg}_*.apk" -newer "$marker" 2>/dev/null | head -1)"
+        if [ -n "$f" ]; then
+            size1="$(filesize "$f")"
+            sleep 2
+            size2="$(filesize "$f")"
+            if [ "$size1" = "$size2" ] && [ "$size1" -gt 100000 ] && [ ! -e "$f.crdownload" ] && [ ! -e "$f.part" ]; then
+                printf '%s\n' "$f"
+                return 0
+            fi
+        fi
+        sleep 2
+        waited=$((waited + 4))
+    done
+    return 1
+}
+
+apkmirror_api_json() {
+    if [ -n "${FSC_APKMIRROR_JSON:-}" ]; then cat "$FSC_APKMIRROR_JSON"; return; fi
+    curl -fsSL -X POST "$APKMIRROR_API" -H "Authorization: $APKMIRROR_AUTH" -H 'User-Agent: APKUpdater-v3.0.3' \
+        -H 'Content-Type: application/json' -d "{\"pnames\":[\"$1\"]}"
+}
+
+# apkmirror_lookup <package>
+# Picks the newest variant that fits this device (min API <= device API, matching CPU) and
+# sets AM_VERSION AM_VCODE AM_MINAPI AM_ARCHES AM_SHA256 AM_PAGE.
+apkmirror_lookup() {
+    local pkg="$1" json apks best
+    json="$(apkmirror_api_json "$pkg" 2>/dev/null | sed 's#\\/#/#g')" || return 1
+    printf '%s' "$json" | grep -q '"exists":true' || return 1
+    AM_VERSION="$(printf '%s' "$json" | sed -n 's/.*"release":{"version":"\([^"]*\)".*/\1/p')"
+    apks="$(printf '%s' "$json" | sed -n 's/.*"apks":\[\(.*\)\]}\]}[[:space:]]*$/\1/p' | awk '{ gsub(/\},\{/, "}\n{"); print }')"
+    best="$(printf '%s\n' "$apks" | awk -v sdk="$DEV_SDK" -v abis="$DEV_ABIS" '
+        function str(s, k,   m) {
+            if (match(s, "\"" k "\":\"[^\"]*\"")) { m = substr(s, RSTART, RLENGTH); sub(/^"[^"]*":"/, "", m); sub(/"$/, "", m); return m }
+            return ""
+        }
+        function arr(s, k,   m) {
+            if (match(s, "\"" k "\":\\[[^]]*\\]")) { m = substr(s, RSTART, RLENGTH); sub(/^"[^"]*":\[/, "", m); sub(/\]$/, "", m); gsub(/"/, "", m); return m }
+            return ""
+        }
+        {
+            minapi = str($0, "minapi") + 0
+            if (sdk > 0 && minapi > sdk) next
+            n = split(arr($0, "arches"), a, ",")
+            fits = (n == 0); arm64 = 0
+            for (i = 1; i <= n; i++) {
+                if (a[i] == "universal" || a[i] == "noarch" || index("," abis ",", "," a[i] ",") > 0) {
+                    fits = 1
+                    if (a[i] == "arm64-v8a") arm64 = 1
+                }
+            }
+            if (!fits) next
+            score = minapi * 10 + arm64 * 5 + (index(arr($0, "dpis"), "nodpi") > 0)
+            if (score > best) { best = score; line = $0 }
+        }
+        END { print line }')"
+    [ -n "$best" ] || return 1
+    AM_VCODE="$(printf '%s' "$best" | sed -n 's/.*"version_code":"\([^"]*\)".*/\1/p')"
+    AM_MINAPI="$(printf '%s' "$best" | sed -n 's/.*"minapi":"\([^"]*\)".*/\1/p')"
+    AM_ARCHES="$(printf '%s' "$best" | sed -n 's/.*"arches":\[\([^]]*\)\].*/\1/p' | tr -d '"')"
+    AM_SHA256="$(printf '%s' "$best" | sed -n 's/.*"signatures-sha256":\["\([0-9a-f]*\)".*/\1/p')"
+    AM_PAGE="https://www.apkmirror.com$(printf '%s' "$best" | sed -n 's/.*"link":"\([^"]*\)".*/\1/p')"
+    [ -n "$AM_VCODE" ] && [ -n "$AM_PAGE" ]
+}
+
+# apkmirror_fetch <section> <package> -> sets APK_FILE (and EXPECTED_VCODE)
+apkmirror_fetch() {
+    local sec="$1" pkg="$2" name page marker found f
+    name="$(lconf "$sec" name)"
+    info "Looking up $name on APKMirror for Android API $DEV_SDK (${DEV_ABIS:-unknown CPU})..."
+    if apkmirror_lookup "$pkg"; then
+        ok "Latest: $name $AM_VERSION (build $AM_VCODE, min API $AM_MINAPI, $AM_ARCHES)"
+        page="$AM_PAGE"
+        mkdir -p "$DOWNLOAD_DIR"
+        for f in "$DOWNLOAD_DIR/${pkg}_"*"-${AM_VCODE}_"*.apk "$DOWNLOAD_DIR/${pkg}_"*"-${AM_VCODE}.apk"; do
+            if [ -f "$f" ]; then
+                APK_FILE="$f"
+                EXPECTED_VCODE="$AM_VCODE"
+                ok "Already downloaded: $(basename "$f")"
+                return 0
+            fi
+        done
+    else
+        warn "Could not query APKMirror; you will have to pick a version yourself (min Android API $DEV_SDK or lower)."
+        page="$(lconf "$sec" page)"
+        AM_VERSION=""; AM_VCODE=""; AM_SHA256=""
+        [ -n "$page" ] || { err "No APKMirror page configured for $name."; return 1; }
+    fi
+    if [ "$NONINTERACTIVE" -eq 1 ]; then
+        err "APKMirror does not allow scripted downloads. Save the ${pkg}_*.apk file in $PLATFORM_DIR and run again."
+        return 1
+    fi
+    say ""
+    say "  APKMirror does not let scripts download files, so your browser will open on the"
+    say "  download page for $name${AM_VERSION:+ $AM_VERSION} that matches this Fire TV."
+    say "  Click 'DOWNLOAD APK' there (and the 'here' link if nothing starts)."
+    say "  Watching $DOWNLOADS_WATCH and $PLATFORM_DIR for the file..."
+    marker="$(mktemp "${TMPDIR:-/tmp}/fsc.XXXXXX")"
+    open_url "$page"
+    found="$(wait_for_download "$pkg" "$marker" 900)"
+    rm -f "$marker"
+    if [ -z "$found" ]; then
+        err "No ${pkg}_*.apk appeared within 15 minutes. Save it in $PLATFORM_DIR and run again."
+        return 1
+    fi
+    mkdir -p "$DOWNLOAD_DIR"
+    APK_FILE="$DOWNLOAD_DIR/$(basename "$found")"
+    [ "$found" = "$APK_FILE" ] || mv -f "$found" "$APK_FILE"
+    ok "Got $(basename "$APK_FILE") ($(human_size "$(filesize "$APK_FILE")"))"
+    verify_apk "$APK_FILE" "$AM_SHA256" || return 1
+    EXPECTED_VCODE="$AM_VCODE"
+}
+
+# gh_latest owner/repo [asset-glob] -> sets GH_URL, GH_SHA (may be empty) and GH_ASSET
+# The glob may contain {abi}; it is tried with each device ABI, then "universal".
+gh_latest() {
+    local repo="$1" pattern="${2:-*.apk}" json assets cand abi name sha url
+    json="$(curl -fsSL -H 'User-Agent: firestick-cleanup' "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)" || return 1
+    # One "name<TAB>sha256<TAB>url" line per asset, in release order.
+    assets="$(printf '%s' "$json" \
+        | grep -o '"name": *"[^"]*"\|"digest": *\("sha256:[0-9a-f]*"\|null\)\|"browser_download_url": *"[^"]*"' \
+        | awk -F'"' '
+            /^"name"/ { name = $4; digest = ""; next }
+            /^"digest"/ { digest = ($0 ~ /sha256:/) ? $4 : ""; sub(/^sha256:/, "", digest); next }
+            /^"browser_download_url"/ { print name "\t" digest "\t" $4 }')"
+    GH_URL=""; GH_SHA=""; GH_ASSET=""
+    for abi in $(printf '%s' "$DEV_ABIS" | tr ',' ' ') universal; do
+        cand="$(printf '%s' "$pattern" | sed "s/{abi}/$abi/g")"
+        while IFS=$'\t' read -r name sha url; do
+            [ -n "$name" ] || continue
+            # shellcheck disable=SC2254  # $cand is meant to be a glob
+            case "$name" in
+                $cand)
+                    GH_ASSET="$name"; GH_SHA="$sha"; GH_URL="$url"
+                    return 0 ;;
+            esac
+        done <<EOF
+$assets
+EOF
+        printf '%s' "$pattern" | grep -q '{abi}' || break
+    done
+    return 1
 }
 
 # fetch_apk <section> -> sets APK_FILE, returns 1 on failure
@@ -407,6 +637,7 @@ fetch_apk() {
     local sec="$1" source name glob f url sha got size
     name="$(lconf "$sec" name)"
     source="$(lconf "$sec" source)"
+    EXPECTED_VCODE=""
     for glob in $(lconf "$sec" apk_glob); do
         for f in "$PLATFORM_DIR"/$glob; do
             if [ -f "$f" ]; then
@@ -419,8 +650,9 @@ fetch_apk() {
     case "$source" in
         github:*)
             info "Fetching latest $name release from GitHub..."
-            if gh_latest "${source#github:}"; then
+            if gh_latest "${source#github:}" "$(lconf "$sec" asset_match)"; then
                 url="$GH_URL"; sha="$GH_SHA"
+                info "Release asset: $GH_ASSET"
             else
                 url="$(lconf "$sec" fallback_url)"; sha=""
                 [ -n "$url" ] || { err "Could not query GitHub releases for $name."; return 1; }
@@ -438,7 +670,7 @@ fetch_apk() {
                 rm -f "$APK_FILE"
                 return 1
             fi
-            size="$(stat -f%z "$APK_FILE" 2>/dev/null || stat -c%s "$APK_FILE" 2>/dev/null || echo 0)"
+            size="$(filesize "$APK_FILE")"
             if [ "$size" -lt 100000 ]; then
                 err "Downloaded file is too small to be an APK."
                 rm -f "$APK_FILE"
@@ -456,6 +688,8 @@ fetch_apk() {
                 ok "Downloaded ($(human_size "$size"))"
             fi
             return 0 ;;
+        apkmirror:*)
+            apkmirror_fetch "$sec" "${source#apkmirror:}" ;;
         manual:*)
             err "$name has to be downloaded by hand from ${source#manual:}"
             say "       Save the APK in: $PLATFORM_DIR"
@@ -493,6 +727,15 @@ install_apk() {
         return 1
     fi
     ok "$name installed"
+    if [ -n "$EXPECTED_VCODE" ]; then
+        out="$(dsh dumpsys package "$pkg" | sed -n 's/.*versionCode=\([0-9]*\).*/\1/p' | head -1)"
+        if [ -n "$out" ] && [ "$out" != "$EXPECTED_VCODE" ]; then
+            warn "Installed build $out differs from the expected build $EXPECTED_VCODE"
+        elif [ -n "$out" ]; then
+            ok "Installed build $out"
+        fi
+        EXPECTED_VCODE=""
+    fi
     state_add_unique installed "$pkg"
 }
 
@@ -568,9 +811,14 @@ configure_app() {
         enable_secure_list enabled_notification_listeners "$nl" "$pkg"
         ok "Notification listener enabled"
     fi
+    for p in $(lconf "$sec" appops); do
+        dsh appops set "$pkg" "$p" allow >/dev/null
+        ok "App op $p allowed"
+    done
+    if [ "$(lconf "$sec" boot)" = yes ]; then
+        prepare_boot "$sec"
+    fi
     if [ "$(lconf "$sec" type)" = launcher ]; then
-        dsh appops set "$pkg" SYSTEM_ALERT_WINDOW allow >/dev/null
-        ok "Overlay permission granted"
         dsh cmd role add-role-holder android.app.role.HOME "$pkg" >/dev/null
         ok "HOME role assigned"
         dsh cmd package set-home-activity --user 0 "$act" >/dev/null
@@ -578,6 +826,86 @@ configure_app() {
     fi
     disable_replaced_packages "$sec"
     launch_app "$sec"
+}
+
+# Keeps an app's boot receiver and accessibility service from being throttled: doze
+# whitelist, background execution allowed, "active" standby bucket. Best effort per firmware.
+prepare_boot() {
+    local pkg
+    pkg="$(lconf "$1" package)"
+    dsh dumpsys deviceidle whitelist "+$pkg" >/dev/null
+    dsh appops set "$pkg" RUN_IN_BACKGROUND allow >/dev/null
+    dsh appops set "$pkg" RUN_ANY_IN_BACKGROUND allow >/dev/null
+    dsh am set-standby-bucket "$pkg" active >/dev/null
+    if dsh dumpsys deviceidle whitelist | grep -q "$pkg"; then
+        ok "Allowed to run at boot and in the background"
+    else
+        info "Could not add $pkg to the doze whitelist (not supported on this firmware)"
+    fi
+}
+
+# Package holding the HOME role. Android 12+ has get-role-holders; older firmware
+# (Fire OS 8 is Android 11) is asked which app resolves the HOME intent instead.
+home_role_holder() {
+    local out
+    out="$(dsh cmd role get-role-holders android.app.role.HOME)"
+    case "$out" in
+        ""|*"Unknown command"*|*Error*|*Exception*)
+            # Android 11: read the role dump ("name=android.app.role.HOME" then "holders=pkg").
+            out="$(dsh dumpsys role | awk '/name=android.app.role.HOME$/ { f = 1; next } f && /holders=/ { sub(/.*holders=/, ""); print; exit }')" ;;
+    esac
+    printf '%s\n' "$out" | sed 's#[/;,].*##' | head -1
+}
+
+# Package name of the window that currently has focus, or empty.
+foreground_pkg() {
+    local line
+    line="$(dsh "dumpsys window 2>/dev/null | grep -m1 mCurrentFocus")"
+    [ -n "$line" ] || line="$(dsh "dumpsys activity activities 2>/dev/null | grep -m1 mResumedActivity")"
+    printf '%s' "$line" | sed -n 's/.* u[0-9]* \([A-Za-z0-9_.]*\)\/.*/\1/p' | head -1
+}
+
+# verify_boot <launcher-section> [addon-sections...]
+# After the reboot: waits for boot to complete, checks that the launcher and every
+# boot add-on is running, and tests the Home-button redirect if Amazon's home is in front.
+verify_boot() {
+    local launcher="$1" sec pkg name fg waited=0 count
+    shift
+    banner "STEP 8: Checking what starts at boot"
+    while [ "$waited" -lt 90 ] && [ "$(dsh getprop sys.boot_completed | tr -dc '0-9')" != "1" ]; do
+        sleep 3
+        waited=$((waited + 3))
+    done
+    sleep 10
+    for sec in "$launcher" "$@"; do
+        [ "$(lconf "$sec" boot)" = yes ] || continue
+        pkg="$(lconf "$sec" package)"
+        name="$(lconf "$sec" name)"
+        count="$(dsh "(ps -A 2>/dev/null || ps) | grep -c $pkg" | tr -dc '0-9')"
+        if [ "${count:-0}" -gt 0 ]; then
+            ok "$name is running after boot"
+        else
+            warn "$name is not running after boot"
+        fi
+    done
+    pkg="$(lconf "$launcher" package)"
+    name="$(lconf "$launcher" name)"
+    fg="$(foreground_pkg)"
+    if [ "$fg" = "$pkg" ]; then
+        ok "On screen after boot: $name"
+        return 0
+    fi
+    info "On screen after boot: ${fg:-unknown}. Pressing Home to test the redirect..."
+    dsh input keyevent 3 >/dev/null
+    sleep 7
+    fg="$(foreground_pkg)"
+    if [ "$fg" = "$pkg" ]; then
+        ok "After pressing Home: $name takes over"
+    else
+        warn "After pressing Home: ${fg:-unknown} is still in front."
+        say "      On the TV, check: Home on Fire > 'Choose target app' is set and 'Launch on boot' is on;"
+        say "      Projectivy > Settings > General > 'Override current launcher' (OFF if you use Home on Fire)."
+    fi
 }
 
 show_notes() {
@@ -856,7 +1184,7 @@ do_status() {
     local k pkg acc role disabled
     banner "STATUS for $TARGET"
     acc="$(dsh settings get secure enabled_accessibility_services)"
-    role="$(dsh cmd role get-role-holders android.app.role.HOME)"
+    role="$(home_role_holder)"
     disabled="$(dsh pm list packages -d | sed 's/^package://')"
     for k in $(lconf_sections); do
         pkg="$(lconf "$k" package)"
@@ -997,6 +1325,8 @@ do_install() {
     verify_app "$LAUNCHER_KEY"
     for sec in $(csv_items "$CHOSEN_ADDONS"); do verify_app "$sec"; done
     say "  [OK] $(dsh pm list packages -d | grep -c 'package:') packages are disabled on the device"
+    # shellcheck disable=SC2046  # add-on keys are single words
+    verify_boot "$LAUNCHER_KEY" $(csv_items "$CHOSEN_ADDONS")
 
     capture_mem
     banner "RAM: before vs after"
@@ -1016,10 +1346,27 @@ do_install() {
 }
 
 verify_app() {
-    local sec="$1" pkg name
+    local sec="$1" pkg name p
     pkg="$(lconf "$sec" package)"
     name="$(lconf "$sec" name)"
     if dsh pm path "$pkg" | grep -q "package:"; then ok "$name is installed"; else err "$name is NOT installed"; fi
+    for p in $(lconf "$sec" grant); do
+        if dsh dumpsys package "$pkg" | grep -q "$p: granted=true"; then
+            ok "$name has ${p##*.}"
+            continue
+        fi
+        # Grants made shortly before a reboot can be lost; grant again and re-check.
+        dsh pm grant "$pkg" "$p" >/dev/null
+        if dsh dumpsys package "$pkg" | grep -q "$p: granted=true"; then
+            ok "$name has ${p##*.} (granted again; the first grant did not persist)"
+        elif [ "$p" = android.permission.WRITE_SECURE_SETTINGS ] && [ -n "$(lconf "$sec" accessibility)" ]; then
+            warn "${p##*.} cannot be granted on this firmware."
+            say "      Not a problem: the accessibility service was enabled directly over adb instead;"
+            say "      only the app's own in-app accessibility toggle needs that permission."
+        else
+            err "$name is missing ${p##*.} (grant it with: adb shell pm grant $pkg $p)"
+        fi
+    done
     if [ -n "$(lconf "$sec" accessibility)" ]; then
         if dsh settings get secure enabled_accessibility_services | grep -q "$pkg"; then
             ok "$name accessibility service is active"
@@ -1028,7 +1375,7 @@ verify_app() {
         fi
     fi
     if [ "$(lconf "$sec" type)" = launcher ]; then
-        if dsh cmd role get-role-holders android.app.role.HOME | grep -q "$pkg"; then
+        if [ "$(home_role_holder)" = "$pkg" ]; then
             ok "$name holds the HOME role"
         else
             warn "$name does not hold the HOME role (expected on some firmware; the Home-button service still works)"
@@ -1075,6 +1422,24 @@ do_reapply() {
     say "  Disabled this run: $TOTAL_DISABLED (protected: $TOTAL_PROTECTED)"
 }
 
+do_test_boot() {
+    local lk sec
+    lk="$(state_get launcher)"
+    [ -n "$lk" ] || die "No saved state for $FIRE_IP; run an install first."
+    banner "BOOT TEST on $TARGET"
+    reboot_and_reconnect || die "Could not reconnect after reboot."
+    reapply_disabled
+    if [ "$REAPPLIED" -gt 0 ]; then
+        ok "Re-disabled $REAPPLIED packages that came back after the reboot"
+    else
+        ok "All packages stayed disabled after the reboot"
+    fi
+    verify_app "$lk"
+    for sec in $(csv_items "$(state_get addons)"); do verify_app "$sec"; done
+    # shellcheck disable=SC2046  # add-on keys are single words
+    verify_boot "$lk" $(csv_items "$(state_get addons)")
+}
+
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
@@ -1096,11 +1461,13 @@ main() {
 
     ask_ip
     connect_device || die "Connection failed."
+    read_device_info
 
     case "$MODE" in
         status)  do_status ;;
         revert)  do_revert ;;
         reapply) do_reapply ;;
+        test-boot) do_test_boot ;;
         *)       do_install ;;
     esac
 
