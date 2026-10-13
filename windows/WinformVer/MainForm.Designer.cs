@@ -11,7 +11,7 @@ namespace FirestickCleanup
         private Label lblLauncher;
         private ComboBox cmbLauncher;
         private Label lblLauncherSummary;
-        private CheckBox chkHomeOnFire;
+        private FlowLayoutPanel pnlAddons;
         private GroupBox grpOptions;
         private FlowLayoutPanel pnlOptions;
         private Button btnStart;
@@ -42,7 +42,7 @@ namespace FirestickCleanup
             this.lblLauncher = new Label();
             this.cmbLauncher = new ComboBox();
             this.lblLauncherSummary = new Label();
-            this.chkHomeOnFire = new CheckBox();
+            this.pnlAddons = new FlowLayoutPanel();
             this.grpOptions = new GroupBox();
             this.pnlOptions = new FlowLayoutPanel();
             this.btnStart = new Button();
@@ -85,15 +85,17 @@ namespace FirestickCleanup
             this.lblLauncherSummary.ForeColor = SystemColors.GrayText;
             this.lblLauncherSummary.Text = "";
 
-            // chkHomeOnFire
-            this.chkHomeOnFire.AutoSize = true;
-            this.chkHomeOnFire.Location = new Point(14, 80);
-            this.chkHomeOnFire.Text = "Install Home on Fire (redirects the Home button to your launcher; required for Couchy, optional for Projectivy and AT4K)";
-            this.toolTip.SetToolTip(this.chkHomeOnFire, "github.com/toolicious/home-on-fire. After install, pick your launcher under 'Choose target app' in the app.");
+            // pnlAddons (one checkbox per add-on in launchers.conf, filled at load)
+            this.pnlAddons.Location = new Point(12, 76);
+            this.pnlAddons.Size = new Size(836, 54);
+            this.pnlAddons.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            this.pnlAddons.FlowDirection = FlowDirection.TopDown;
+            this.pnlAddons.WrapContents = false;
+            this.pnlAddons.AutoScroll = true;
 
             // grpOptions / pnlOptions
-            this.grpOptions.Location = new Point(12, 108);
-            this.grpOptions.Size = new Size(836, 236);
+            this.grpOptions.Location = new Point(12, 134);
+            this.grpOptions.Size = new Size(836, 210);
             this.grpOptions.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             this.grpOptions.Text = "Optional Amazon apps to disable (tracking, telemetry, ads and background bloat are always disabled)";
             this.pnlOptions.Dock = DockStyle.Fill;
@@ -158,7 +160,7 @@ namespace FirestickCleanup
             this.Controls.Add(this.lblLauncher);
             this.Controls.Add(this.cmbLauncher);
             this.Controls.Add(this.lblLauncherSummary);
-            this.Controls.Add(this.chkHomeOnFire);
+            this.Controls.Add(this.pnlAddons);
             this.Controls.Add(this.grpOptions);
             this.Controls.Add(this.btnStart);
             this.Controls.Add(this.btnReapply);

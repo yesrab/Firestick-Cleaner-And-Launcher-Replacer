@@ -33,6 +33,7 @@ namespace FirestickCleanup
         private List<GroupDef> groups = new List<GroupDef>();
         private List<AppDef> apps = new List<AppDef>();
         private readonly Dictionary<string, CheckBox> groupBoxes = new Dictionary<string, CheckBox>();
+        private readonly Dictionary<string, CheckBox> addonBoxes = new Dictionary<string, CheckBox>();
 
         // Per-run state (set by StartRun on the UI thread before the background work begins).
         private string ip;
@@ -42,7 +43,7 @@ namespace FirestickCleanup
         private sealed class Choices
         {
             public AppDef Launcher;
-            public bool HomeOnFire;
+            public List<string> Addons = new List<string>();
             public List<string> Groups = new List<string>();
         }
 
@@ -77,6 +78,16 @@ namespace FirestickCleanup
                 return;
             }
 
+            pnlAddons.Controls.Clear();
+            addonBoxes.Clear();
+            foreach (var addon in apps.Where(a => a.IsAddon))
+            {
+                var cb = new CheckBox { Text = addon.Name + ": " + addon.Summary, AutoSize = true, Tag = addon, Margin = new Padding(4, 2, 4, 2) };
+                toolTip.SetToolTip(cb, addon.Prompt);
+                pnlAddons.Controls.Add(cb);
+                addonBoxes[addon.Key] = cb;
+            }
+
             cmbLauncher.Items.Clear();
             foreach (var app in apps.Where(a => a.IsLauncher)) cmbLauncher.Items.Add(app);
             if (cmbLauncher.Items.Count > 0) cmbLauncher.SelectedIndex = 0;
@@ -100,12 +111,18 @@ namespace FirestickCleanup
             var app = cmbLauncher.SelectedItem as AppDef;
             if (app == null) return;
             lblLauncherSummary.Text = app.Summary;
-            chkHomeOnFire.Checked = app.NeedsHomeOnFire;
+            var needs = app.Needs.ToList();
+            foreach (var kv in addonBoxes)
+            {
+                var addon = (AppDef)kv.Value.Tag;
+                kv.Value.Checked = addon.DefaultOn || needs.Contains(kv.Key);
+            }
         }
 
         private Choices ReadChoices()
         {
-            var c = new Choices { Launcher = cmbLauncher.SelectedItem as AppDef, HomeOnFire = chkHomeOnFire.Checked };
+            var c = new Choices { Launcher = cmbLauncher.SelectedItem as AppDef };
+            foreach (var kv in addonBoxes) if (kv.Value.Checked) c.Addons.Add(kv.Key);
             foreach (var kv in groupBoxes) if (kv.Value.Checked) c.Groups.Add(kv.Key);
             return c;
         }
@@ -187,17 +204,18 @@ namespace FirestickCleanup
 
             state.Set("version", Version);
             state.Set("launcher", c.Launcher.Key);
-            state.Set("home_on_fire", c.HomeOnFire ? "yes" : "no");
+            state.Set("addons", string.Join(",", c.Addons));
             state.Set("groups", string.Join(",", c.Groups));
 
             SetProgress(15, "Installing " + c.Launcher.Name + "...");
             if (!await SetupAppAsync(c.Launcher)) { SetStatus("Launcher setup failed."); return; }
 
-            var hof = apps.FirstOrDefault(a => a.Key == "homeonfire");
-            if (c.HomeOnFire && hof != null)
+            var addons = c.Addons.Select(k => apps.FirstOrDefault(a => a.Key == k)).Where(a => a != null).ToList();
+            int step = 0;
+            foreach (var addon in addons)
             {
-                SetProgress(40, "Installing Home on Fire...");
-                if (!await SetupAppAsync(hof)) { SetStatus("Home on Fire setup failed."); return; }
+                SetProgress(30 + 20 * step++ / Math.Max(1, addons.Count), "Installing " + addon.Name + "...");
+                if (!await SetupAppAsync(addon)) { SetStatus(addon.Name + " setup failed."); return; }
             }
 
             SetProgress(55, "Disabling bloatware...");
@@ -223,7 +241,7 @@ namespace FirestickCleanup
 
             SetProgress(92, "Verifying...");
             await VerifyAppAsync(c.Launcher);
-            if (c.HomeOnFire && hof != null) await VerifyAppAsync(hof);
+            foreach (var addon in addons) await VerifyAppAsync(addon);
             Log($"  [OK] {(await DisabledNowAsync()).Count} packages are disabled on the device");
 
             var after = await CaptureMemAsync();
@@ -233,7 +251,7 @@ namespace FirestickCleanup
             Log($"  Available RAM:    {before.avail,4} MB    {after.avail,4} MB   (+{freed} MB freed)");
             Log($"  Amazon processes: {before.procs,4}        {after.procs,4}       (-{before.procs - after.procs})");
             Log("");
-            Log($"  ALL DONE: {c.Launcher.Name}, Home on Fire {(c.HomeOnFire ? "yes" : "no")}, {totalDisabled} packages disabled ({totalProtected} protected), {freed} MB freed.");
+            Log($"  ALL DONE: {c.Launcher.Name}, add-ons: {(c.Addons.Count > 0 ? string.Join(",", c.Addons) : "none")}, {totalDisabled} packages disabled ({totalProtected} protected), {freed} MB freed.");
             Log($"  State saved to {state.Path}. Use Re-apply after a Fire OS update, Revert to undo.");
             SetProgress(100, $"Done: {totalDisabled} packages disabled, {freed} MB freed.");
         }
@@ -270,10 +288,13 @@ namespace FirestickCleanup
             {
                 if (await ConfigureAppAsync(launcher)) Log($"  [OK] {launcher.Name} settings re-applied");
             }
-            var hof = apps.FirstOrDefault(a => a.Key == "homeonfire");
-            if (state.Get("home_on_fire") == "yes" && hof != null && await IsInstalledAsync(hof.Package))
+            foreach (var key in state.Get("addons").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
             {
-                if (await ConfigureAppAsync(hof)) Log("  [OK] Home on Fire settings re-applied");
+                var addon = apps.FirstOrDefault(a => a.Key == key);
+                if (addon != null && await IsInstalledAsync(addon.Package))
+                {
+                    if (await ConfigureAppAsync(addon)) Log($"  [OK] {addon.Name} settings re-applied");
+                }
             }
             SetProgress(100, $"Re-apply complete: {disabled} disabled, {prot} protected.");
         }
@@ -306,7 +327,7 @@ namespace FirestickCleanup
             if (state.Exists)
             {
                 Log($"  Saved state ({state.Path}):");
-                Log($"      launcher={state.Get("launcher")} home_on_fire={state.Get("home_on_fire")} groups={state.Get("groups")}");
+                Log($"      launcher={state.Get("launcher")} addons={state.Get("addons")} groups={state.Get("groups")}");
                 Log($"      recorded as disabled by this tool: {state.GetAll("disabled").Count}");
             }
             else Log("  No saved state for this device (nothing recorded by this tool yet).");
@@ -598,14 +619,42 @@ namespace FirestickCleanup
                 await DshAsync("cmd", "package", "set-home-activity", "--user", "0", app.Activity);
                 Log("  [OK] Default home activity set");
             }
-            var launch = await DshAsync("am", "start", "-n", app.Activity);
-            if (launch.Contains("Error"))
-            {
-                var monkey = await DshAsync("monkey", "-p", app.Package, "-c", "android.intent.category.LEANBACK_LAUNCHER", "1");
-                Log(monkey.Contains("Events injected") ? $"  [OK] {app.Name} launched" : $"  [--] Could not launch {app.Name} automatically; open it from the Fire TV app list.");
-            }
-            else Log($"  [OK] {app.Name} launched");
+            await DisableReplacedPackagesAsync(app);
+            await LaunchAppAsync(app);
             return true;
+        }
+
+        private async Task LaunchAppAsync(AppDef app)
+        {
+            if (app.Activity.Length > 0)
+            {
+                var launch = await DshAsync("am", "start", "-n", app.Activity);
+                if (!launch.Contains("Error")) { Log($"  [OK] {app.Name} launched"); return; }
+            }
+            // No activity configured, or it failed: resolve the app's leanback launcher entry instead.
+            var monkey = await DshAsync("monkey", "-p", app.Package, "-c", "android.intent.category.LEANBACK_LAUNCHER", "1");
+            Log(monkey.Contains("Events injected") ? $"  [OK] {app.Name} launched" : $"  [--] Could not launch {app.Name} automatically; open it from the Fire TV app list.");
+        }
+
+        /// <summary>Disables the packages an add-on replaces (its "disables=" line), recording them for revert.</summary>
+        private async Task DisableReplacedPackagesAsync(AppDef app)
+        {
+            var wanted = app.Disables.ToList();
+            if (wanted.Count == 0) return;
+            var now = (await DisabledNowAsync()).ToHashSet();
+            var pkgs = new List<string>();
+            foreach (var p in wanted)
+            {
+                if (now.Contains(p)) Log($"  [..] {p} is already disabled");
+                else if (await IsInstalledAsync(p)) pkgs.Add(p);
+                else Log($"  [..] {p} is not on this device");
+            }
+            if (pkgs.Count == 0) return;
+            foreach (var kv in await DisableBatchAsync(pkgs))
+            {
+                if (kv.Value == "disabled") { Log($"  [OK] Disabled: {kv.Key} (replaced by {app.Name})"); state.AddUnique("disabled", kv.Key); }
+                else Log($"  [--] Could not disable {kv.Key} ({kv.Value})");
+            }
         }
 
         private async Task<bool> SetupAppAsync(AppDef app)
@@ -846,7 +895,7 @@ namespace FirestickCleanup
         {
             if (btnStart.InvokeRequired) { btnStart.BeginInvoke((Action)(() => SetButtons(enabled))); return; }
             btnStart.Enabled = btnReapply.Enabled = btnStatus.Enabled = btnRevert.Enabled = enabled;
-            txtDeviceIP.Enabled = cmbLauncher.Enabled = chkHomeOnFire.Enabled = grpOptions.Enabled = enabled;
+            txtDeviceIP.Enabled = cmbLauncher.Enabled = pnlAddons.Enabled = grpOptions.Enabled = enabled;
         }
 
         private void ShowMessage(string text, string title)

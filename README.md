@@ -8,7 +8,7 @@ Replace the ad-filled Amazon Fire TV home screen with a launcher of your choice 
 
 1. Connects to your Fire TV over ADB (Wi-Fi) and waits for you to accept the prompt on the TV
 2. Installs the launcher you pick: **Projectivy**, **AT4K** or **Couchy**
-3. Optionally installs **Home on Fire**, which makes the Home button open your launcher
+3. Optionally installs add-ons: **Home on Fire** (makes the Home button open your launcher) and **YouTube for Android TV** (Google's official app in place of Amazon's YouTube wrapper)
 4. Asks which optional Amazon apps you want to keep (Music, Photos, Appstore, Prime Video services...)
 5. Disables tracking, telemetry, ads and background bloat, plus your optional choices
 6. Reboots, verifies, and re-disables anything Amazon re-enabled during the reboot
@@ -23,11 +23,21 @@ Replace the ad-filled Amazon Fire TV home screen with a launcher of your choice 
 | [AT4K Launcher](https://at4k.com/) | Its own accessibility service | **Not bundled.** Download it yourself and save it next to the script as `AT4K*.apk` or `base.apk` | Lightweight. |
 | [Couchy Launcher](https://github.com/conreo/couchy-launcher) | None. Pair it with Home on Fire | Downloaded automatically from GitHub, SHA-256 verified | Minimal, open source, no Google services needed. |
 
-### Home on Fire
+## Add-ons
 
-[Home on Fire](https://github.com/toolicious/home-on-fire) is a tiny open-source app that intercepts the Home button and opens the launcher you choose. It is **required for Couchy** (which has no Home-button service of its own) and optional for Projectivy and AT4K, which bring their own. The script installs it, grants it the `WRITE_SECURE_SETTINGS` permission and enables its accessibility service. You then pick your launcher once under **Choose target app** inside the app.
+Add-ons are asked about one by one after the launcher, and can be forced with `--with <key>` or skipped with `--without <key>`. Each add-on is a section in `common/launchers.conf`.
+
+### Home on Fire (`homeonfire`)
+
+[Home on Fire](https://github.com/toolicious/home-on-fire) is a tiny open-source app that intercepts the Home button and opens the launcher you choose. It is **required for Couchy** (which has no Home-button service of its own, so the prompt defaults to yes there) and optional for Projectivy and AT4K, which bring their own. The script downloads and verifies it, grants it the `WRITE_SECURE_SETTINGS` permission and enables its accessibility service. You then pick your launcher once under **Choose target app** inside the app.
 
 Known behaviour from the Home on Fire project: on Fire OS 8 the Amazon home screen flashes briefly before your launcher appears; on Fire OS 7 a Home press can take a few seconds. Long-press Home to get back to the Amazon home screen at any time. Fire OS 6 and older are not supported.
+
+### YouTube for Android TV (`youtubetv`)
+
+Replaces Amazon's Fire TV YouTube wrapper (`com.amazon.firetv.youtube`) with Google's official YouTube for Android TV app (`com.google.android.youtube.tv`), the same app that ships on Android TV and Google TV devices. The script installs the APK, disables the Amazon wrapper so only one YouTube shows in your launcher, and records that so `--revert` puts the Amazon app back.
+
+Google does not publish this APK for direct download, so **you have to supply it**: download the current release from a mirror you trust (for example the [APKMirror listing](https://www.apkmirror.com/apk/google-inc/youtube-for-android-tv/), which checks that uploads carry Google's signature) and save it next to the entry point as `YouTube*.apk`. Pick the newest version whose minimum Android matches your Fire OS (Fire OS 7 is Android 9, Fire OS 8 is Android 11). Sign-in uses the on-screen code at youtube.com/activate; on some Fire OS versions sign-in needs Google services and does not work, but playback works signed out.
 
 ## Platforms
 
@@ -64,7 +74,7 @@ Firestick-Cleaner-And-Launcher-Replacer.bat --revert
 
 ### Windows (GUI)
 
-Build `windows/WinformVer/WinformVer.csproj` with Visual Studio or `dotnet build`, or download the `FirestickCleanup-WinForms` artifact from the latest CI run. The GUI has the same launcher menu, Home on Fire option and per-group checkboxes, plus **Install + Clean**, **Re-apply**, **Status** and **Revert** buttons.
+Build `windows/WinformVer/WinformVer.csproj` with Visual Studio or `dotnet build`, or download the `FirestickCleanup-WinForms` artifact from the latest CI run. The GUI has the same launcher menu, add-on checkboxes and per-group checkboxes, plus **Install + Clean**, **Re-apply**, **Status** and **Revert** buttons.
 
 ### macOS
 
@@ -89,8 +99,8 @@ Modes (default: full install)
 Options
   --ip <ip[:port]>    Fire TV address (skips the prompt; the last used address is remembered)
   --launcher <key>    projectivy | at4k | couchy   (default: projectivy)
-  --home-on-fire      Also install Home on Fire
-  --no-home-on-fire   Skip Home on Fire
+  --with <a,b,..>     Add-ons to install: homeonfire, youtubetv
+  --without <a,b,..>  Add-ons to skip (--home-on-fire / --no-home-on-fire are shorthands for homeonfire)
   --disable <a,b,..>  Optional groups to disable, comma-separated (keys from packages.conf)
   -y, --non-interactive
                       Never prompt; requires --ip
@@ -99,8 +109,8 @@ Options
 Examples:
 
 ```
-# Couchy + Home on Fire, also disable the video stack and update services, no questions asked
-./Firestick-Cleaner-And-Launcher-Replacer.sh --ip 10.0.0.20 --launcher couchy --home-on-fire --disable video,updates -y
+# Couchy + Home on Fire + YouTube for Android TV, also disable the video stack and update services, no questions asked
+./Firestick-Cleaner-And-Launcher-Replacer.sh --ip 10.0.0.20 --launcher couchy --with homeonfire,youtubetv --disable video,updates -y
 
 # After a Fire OS update put everything back the way it was
 ./Firestick-Cleaner-And-Launcher-Replacer.sh --ip 10.0.0.20 --reapply -y
@@ -111,11 +121,11 @@ Examples:
 
 ### After a Fire OS update
 
-Updates re-enable packages and sometimes wipe the accessibility settings. Run with `--reapply`: it reads the choices saved for that device, re-disables what came back, and re-applies the launcher and Home on Fire settings without reinstalling anything or asking questions.
+Updates re-enable packages and sometimes wipe the accessibility settings. Run with `--reapply`: it reads the choices saved for that device, re-disables what came back, and re-applies the launcher and add-on settings without reinstalling anything or asking questions.
 
 ### Reverting
 
-`--revert` reads the state file written for the device (`firestick_cleanup_<ip>.state` next to the entry point) and undoes exactly what was recorded: re-enables those packages, restores the previous accessibility and notification-listener values, removes the HOME role and overlay permission from the launcher, uninstalls the launcher and Home on Fire, and hands the HOME role back to the Amazon launcher. If no state file exists it warns and offers to re-enable every disabled package instead.
+`--revert` reads the state file written for the device (`firestick_cleanup_<ip>.state` next to the entry point) and undoes exactly what was recorded: re-enables those packages (including ones an add-on replaced, such as Amazon's YouTube), restores the previous accessibility and notification-listener values, removes the HOME role and overlay permission from the launcher, uninstalls the launcher and the add-ons, and hands the HOME role back to the Amazon launcher. If no state file exists it warns and offers to re-enable every disabled package instead.
 
 ## What gets disabled
 
@@ -195,7 +205,7 @@ Amazon protects the stock launcher as a system package on most firmware, so it u
 ## Customising
 
 - **Packages:** edit `common/packages.conf`. Add a line to a group, or add a new `[key] Prompt text` group and it becomes a new Y/N question and `--disable` key on every platform.
-- **Launchers:** edit `common/launchers.conf`. Adding a launcher is a new section with its package, activity, optional accessibility service and APK source. No code changes are needed.
+- **Launchers and add-ons:** edit `common/launchers.conf`. Adding a launcher is a new `type=launcher` section with its package, activity, optional accessibility service and APK source. Adding an add-on is a `type=addon` section with a prompt, an optional `disables=` list of packages it replaces, and the same install fields. No code changes are needed.
 
 ## Project structure
 

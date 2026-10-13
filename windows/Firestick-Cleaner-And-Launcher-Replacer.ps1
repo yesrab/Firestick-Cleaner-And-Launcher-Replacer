@@ -23,7 +23,8 @@ $DeviceTmp     = '/data/local/tmp'
 $LogFile       = Join-Path $PlatformDir ('firestick_cleanup_{0:yyyyMMdd_HHmmss}.log' -f (Get-Date))
 $EntryName     = 'Firestick-Cleaner-And-Launcher-Replacer.bat'
 
-$Mode = 'install'; $FireIp = ''; $Port = 5555; $LauncherKey = ''; $HofChoice = ''
+$Mode = 'install'; $FireIp = ''; $Port = 5555; $LauncherKey = ''
+$AddonsWith = @(); $AddonsWithout = @(); $ChosenAddons = ''
 $DisableGroups = ''; $NonInteractive = $false; $ADB = ''; $Target = ''; $StateFile = ''
 $State = New-Object System.Collections.ArrayList
 $TotalDisabled = 0; $TotalProtected = 0; $Passes = 0; $Reapplied = 0
@@ -46,16 +47,18 @@ Modes (default: full install)
 Options
   --ip <ip[:port]>    Fire TV address (skips the prompt)
   --launcher <key>    projectivy | at4k | couchy   (default: projectivy)
-  --home-on-fire      Also install Home on Fire
-  --no-home-on-fire   Skip Home on Fire
+  --with <a,b,..>     Add-ons to install: homeonfire, youtubetv (see common\launchers.conf)
+  --without <a,b,..>  Add-ons to skip
+  --home-on-fire      Same as --with homeonfire      --no-home-on-fire: --without homeonfire
   --disable <a,b,..>  Optional groups to disable, comma-separated (see common\packages.conf)
   -y, --non-interactive
-                      Never prompt; requires --ip.
+                      Never prompt; requires --ip. Uses --launcher/--with/--disable,
+                      or the saved choices for --reapply.
   -h, --help          This help
 
 Examples
   $EntryName
-  $EntryName --ip 10.0.0.20 --launcher couchy --home-on-fire --disable video,appstore -y
+  $EntryName --ip 10.0.0.20 --launcher couchy --with homeonfire,youtubetv --disable video,appstore -y
   $EntryName --ip 10.0.0.20 --reapply -y
   $EntryName --revert
 "@
@@ -73,8 +76,12 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
         '^(--|-|/)ip=(.+)$'         { $FireIp = $Matches[2]; break }
         '^(--|-|/)launcher$'        { $i++; $LauncherKey = [string]$argv[$i]; break }
         '^(--|-|/)launcher=(.+)$'   { $LauncherKey = $Matches[2]; break }
-        '^(--|-|/)home-?on-?fire$'  { $HofChoice = 'yes'; break }
-        '^(--|-|/)no-?home-?on-?fire$' { $HofChoice = 'no'; break }
+        '^(--|-|/)with$'            { $i++; $AddonsWith += @([string]$argv[$i] -split ','); break }
+        '^(--|-|/)with=(.+)$'       { $AddonsWith += @($Matches[2] -split ','); break }
+        '^(--|-|/)without$'         { $i++; $AddonsWithout += @([string]$argv[$i] -split ','); break }
+        '^(--|-|/)without=(.+)$'    { $AddonsWithout += @($Matches[2] -split ','); break }
+        '^(--|-|/)home-?on-?fire$'  { $AddonsWith += 'homeonfire'; break }
+        '^(--|-|/)no-?home-?on-?fire$' { $AddonsWithout += 'homeonfire'; break }
         '^(--|-|/)disable$'         { $i++; $DisableGroups = [string]$argv[$i]; break }
         '^(--|-|/)disable=(.+)$'    { $DisableGroups = $Matches[2]; break }
         '^(--|-|/)(y|non-?interactive)$' { $NonInteractive = $true; break }
@@ -167,6 +174,10 @@ function Get-Sections {
 
 function Get-LauncherKeys {
     return ,@(Get-Sections | Where-Object { (Get-Conf1 $_ 'type') -eq 'launcher' })
+}
+
+function Get-AddonKeys {
+    return ,@(Get-Sections | Where-Object { (Get-Conf1 $_ 'type') -eq 'addon' })
 }
 
 function Test-Group($key) {
@@ -402,13 +413,33 @@ function Install-Apk($sec, $apk) {
 }
 
 function Start-App($sec) {
-    $name = Get-Conf1 $sec 'name'
-    $out = Invoke-Dsh @('am', 'start', '-n', (Get-Conf1 $sec 'activity'))
-    if ($out -match 'Error') {
-        $out = Invoke-Dsh @('monkey', '-p', (Get-Conf1 $sec 'package'), '-c', 'android.intent.category.LEANBACK_LAUNCHER', '1')
-        if ($out -match 'Events injected') { Ok "$name launched" }
-        else { Warn "Could not launch $name automatically; open it from the Fire TV app list." }
-    } else { Ok "$name launched" }
+    $name = Get-Conf1 $sec 'name'; $act = Get-Conf1 $sec 'activity'
+    if ($act) {
+        $out = Invoke-Dsh @('am', 'start', '-n', $act)
+        if ($out -notmatch 'Error') { Ok "$name launched"; return }
+    }
+    # No activity configured, or it failed: resolve the app's leanback launcher entry instead.
+    $out = Invoke-Dsh @('monkey', '-p', (Get-Conf1 $sec 'package'), '-c', 'android.intent.category.LEANBACK_LAUNCHER', '1')
+    if ($out -match 'Events injected') { Ok "$name launched" }
+    else { Warn "Could not launch $name automatically; open it from the Fire TV app list." }
+}
+
+# Disables the packages an add-on replaces (its "disables=" line), recording them for revert.
+function Disable-ReplacedPackages($sec) {
+    $dis = @((Get-Conf1 $sec 'disables') -split '\s+' | Where-Object { $_ })
+    if ($dis.Count -eq 0) { return }
+    $now = Get-DisabledNow
+    $pkgs = @()
+    foreach ($p in $dis) {
+        if ($now -contains $p) { Info "$p is already disabled" }
+        elseif (Test-Installed $p) { $pkgs += $p }
+        else { Info "$p is not on this device" }
+    }
+    if ($pkgs.Count -eq 0) { return }
+    foreach ($r in (Invoke-DisableBatch $pkgs)) {
+        if ($r.Status -eq 'disabled') { Ok "Disabled: $($r.Pkg) (replaced by $(Get-Conf1 $sec 'name'))"; Add-State 'disabled' $r.Pkg }
+        else { Warn "Could not disable $($r.Pkg) ($($r.Status))" }
+    }
 }
 
 function Set-AppConfig($sec) {
@@ -431,6 +462,7 @@ function Set-AppConfig($sec) {
         Invoke-Dsh @('cmd', 'role', 'add-role-holder', 'android.app.role.HOME', $pkg) | Out-Null; Ok 'HOME role assigned'
         Invoke-Dsh @('cmd', 'package', 'set-home-activity', '--user', '0', $act) | Out-Null; Ok 'Default home activity set'
     }
+    Disable-ReplacedPackages $sec
     Start-App $sec
     return $true
 }
@@ -571,14 +603,25 @@ function Select-Launcher {
     Ok "Launcher: $(Get-Conf1 $script:LauncherKey 'name')"
 }
 
-function Select-HomeOnFire {
-    if ($script:HofChoice) { return }
-    $def = if ((Get-Conf1 $script:LauncherKey 'needs_home_on_fire') -eq 'yes') { 'y' } else { 'n' }
-    Say ''
-    Say '  Home on Fire is a small app that redirects the Home button to your'
-    Say '  launcher. It is required for Couchy and optional for launchers that'
-    Say '  bring their own Home-button service (Projectivy, AT4K).'
-    $script:HofChoice = if (Ask-YesNo 'Install Home on Fire?' $def) { 'yes' } else { 'no' }
+# Sets $ChosenAddons (comma-separated) from --with/--without, the launcher's "needs"
+# list, each add-on's default, and Y/N prompts.
+function Select-Addons {
+    $keys = Get-AddonKeys
+    foreach ($a in @($AddonsWith + $AddonsWithout)) {
+        if ($a -and $keys -notcontains $a) { Die "Unknown add-on '$a'. Known: $($keys -join ' ')" }
+    }
+    $needs = @((Get-Conf1 $script:LauncherKey 'needs') -split '\s+' | Where-Object { $_ })
+    $chosen = @()
+    foreach ($a in $keys) {
+        if ($AddonsWithout -contains $a) { continue }
+        if ($AddonsWith -contains $a) { $chosen += $a; continue }
+        $def = if ((Get-Conf1 $a 'default') -eq 'yes' -or $needs -contains $a) { 'y' } else { 'n' }
+        if ($NonInteractive) { if ($def -eq 'y') { $chosen += $a }; continue }
+        Say ''
+        Say "  $(Get-Conf1 $a 'name'): $(Get-Conf1 $a 'summary')"
+        if (Ask-YesNo (Get-Conf1 $a 'prompt') $def) { $chosen += $a }
+    }
+    $script:ChosenAddons = ($chosen -join ',')
 }
 
 function Select-Groups {
@@ -648,7 +691,7 @@ function Show-Status {
     Say ''
     if (Test-Path $StateFile) {
         Say "  Saved state ($StateFile):"
-        Say "      launcher=$(Get-State1 'launcher') home_on_fire=$(Get-State1 'home_on_fire') groups=$(Get-State1 'groups')"
+        Say "      launcher=$(Get-State1 'launcher') addons=$(Get-State1 'addons') groups=$(Get-State1 'groups')"
         Say "      recorded as disabled by this tool: $(@(Get-State 'disabled').Count)"
     } else {
         Say '  No saved state for this device (nothing recorded by this tool yet).'
@@ -712,7 +755,7 @@ function Invoke-Install {
     Say "  RAM: $($before.Avail) MB available of $($before.Total) MB, $($before.Procs) Amazon processes running"
 
     Select-Launcher
-    Select-HomeOnFire
+    Select-Addons
     $groups = Select-Groups
     Test-Groups $groups
     $bloat = Get-BloatList $groups
@@ -721,7 +764,7 @@ function Invoke-Install {
     if ($Mode -eq 'dry-run') {
         Banner 'DRY RUN - nothing will be changed'
         Say "  Launcher:        $(Get-Conf1 $script:LauncherKey 'name')"
-        Say "  Home on Fire:    $($script:HofChoice)"
+        Say "  Add-ons:         $(if ($script:ChosenAddons) { $script:ChosenAddons } else { 'none' })"
         Say "  Optional groups: $(if ($groups) { $groups } else { 'none' })"
         Say ''
         Say "  Would disable ($($split.Present.Count)):";        foreach ($p in $split.Present) { Say "      $p" }
@@ -732,11 +775,13 @@ function Invoke-Install {
 
     Set-State 'version' $Version
     Set-State 'launcher' $script:LauncherKey
-    Set-State 'home_on_fire' $script:HofChoice
+    Set-State 'addons' $script:ChosenAddons
     Set-State 'groups' $groups
 
     if (-not (Install-App $script:LauncherKey)) { Die 'Launcher setup failed.' }
-    if ($script:HofChoice -eq 'yes') { if (-not (Install-App 'homeonfire')) { Die 'Home on Fire setup failed.' } }
+    foreach ($a in @($script:ChosenAddons -split ',' | Where-Object { $_ })) {
+        if (-not (Install-App $a)) { Die "$(Get-Conf1 $a 'name') setup failed." }
+    }
 
     if ($split.Present.Count -gt 0) { Invoke-DisablePasses $split.Present }
     else { $script:TotalDisabled = 0; $script:TotalProtected = 0; $script:Passes = 0; Info 'Nothing new to disable.' }
@@ -752,7 +797,7 @@ function Invoke-Install {
 
     Banner 'STEP 7: Verifying'
     Test-App $script:LauncherKey
-    if ($script:HofChoice -eq 'yes') { Test-App 'homeonfire' }
+    foreach ($a in @($script:ChosenAddons -split ',' | Where-Object { $_ })) { Test-App $a }
     Say "  [OK] $((Get-DisabledNow).Count) packages are disabled on the device"
 
     $after = Get-Mem
@@ -763,7 +808,7 @@ function Invoke-Install {
 
     Banner 'ALL DONE'
     Say "  Launcher:            $(Get-Conf1 $script:LauncherKey 'name')"
-    Say "  Home on Fire:        $($script:HofChoice)"
+    Say "  Add-ons:             $(if ($script:ChosenAddons) { $script:ChosenAddons } else { 'none' })"
     Say "  Disabled this run:   $($script:TotalDisabled) (protected by Amazon: $($script:TotalProtected))"
     Say "  RAM freed:           $($after.Avail - $before.Avail) MB"
     Say ''
@@ -800,8 +845,10 @@ function Invoke-Reapply {
     if ($lk -and (Test-Installed (Get-Conf1 $lk 'package'))) {
         if (Set-AppConfig $lk) { Ok "$(Get-Conf1 $lk 'name') settings re-applied" }
     }
-    if ((Get-State1 'home_on_fire') -eq 'yes' -and (Test-Installed (Get-Conf1 'homeonfire' 'package'))) {
-        if (Set-AppConfig 'homeonfire') { Ok 'Home on Fire settings re-applied' }
+    foreach ($a in @((Get-State1 'addons') -split ',' | Where-Object { $_ })) {
+        if (Test-Installed (Get-Conf1 $a 'package')) {
+            if (Set-AppConfig $a) { Ok "$(Get-Conf1 $a 'name') settings re-applied" }
+        }
     }
     Banner 'RE-APPLY COMPLETE'
     Say "  Disabled this run: $($script:TotalDisabled) (protected: $($script:TotalProtected))"

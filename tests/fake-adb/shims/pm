@@ -6,7 +6,8 @@ case "$sub" in
   install)
     src=$(cat "$DEV/last_push_src"); case "$src" in
       ProjectivyLauncher*) p=com.spocky.projengmenu ;; Couchy*|couchy*) p=com.conreo.couchytv ;;
-      home-on-fire*) p=io.github.toolicious.homeonfire ;; AT4K*|at4k*|base.apk) p=com.overdevs.at4k ;; *) echo "Failure [INSTALL_PARSE_FAILED]"; exit 1 ;; esac
+      home-on-fire*) p=io.github.toolicious.homeonfire ;; AT4K*|at4k*|base.apk) p=com.overdevs.at4k ;;
+      YouTube*|youtube*) p=com.google.android.youtube.tv ;; *) echo "Failure [INSTALL_PARSE_FAILED]"; exit 1 ;; esac
     grep -qx "$p" "$DEV/installed" || echo "$p" >> "$DEV/installed"; echo "Success" ;;
   disable-user) p="${@: -1}"
     if ! grep -qx "$p" "$DEV/installed"; then echo "Error: java.lang.IllegalArgumentException: Unknown package: $p"

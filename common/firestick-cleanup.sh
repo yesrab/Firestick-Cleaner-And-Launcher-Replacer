@@ -24,7 +24,9 @@ MODE="install"          # install | revert | reapply | status | dry-run
 FIRE_IP=""
 PORT=5555
 LAUNCHER_KEY=""
-HOF_CHOICE=""           # "" (ask) | yes | no
+ADDONS_WITH=""          # comma-separated add-on keys forced on  (--with, --home-on-fire)
+ADDONS_WITHOUT=""       # comma-separated add-on keys forced off (--without, --no-home-on-fire)
+CHOSEN_ADDONS=""
 DISABLE_GROUPS=""       # comma-separated group keys for non-interactive runs
 NONINTERACTIVE=0
 ADB=""
@@ -51,17 +53,18 @@ Modes (default: full install)
 Options
   --ip <ip[:port]>    Fire TV address (skips the prompt)
   --launcher <key>    projectivy | at4k | couchy   (default: projectivy)
-  --home-on-fire      Also install Home on Fire
-  --no-home-on-fire   Skip Home on Fire
+  --with <a,b,..>     Add-ons to install: homeonfire, youtubetv (see launchers.conf)
+  --without <a,b,..>  Add-ons to skip
+  --home-on-fire      Same as --with homeonfire      --no-home-on-fire: --without homeonfire
   --disable <a,b,..>  Optional groups to disable, comma-separated (see packages.conf)
   -y, --non-interactive
-                      Never prompt; requires --ip. Uses --launcher/--disable/--home-on-fire,
+                      Never prompt; requires --ip. Uses --launcher/--with/--disable,
                       or the saved choices for --reapply.
   -h, --help          This help
 
 Examples
   $(basename "$ENTRY")
-  $(basename "$ENTRY") --ip 10.0.0.20 --launcher couchy --home-on-fire --disable video,appstore -y
+  $(basename "$ENTRY") --ip 10.0.0.20 --launcher couchy --with homeonfire,youtubetv --disable video,appstore -y
   $(basename "$ENTRY") --ip 10.0.0.20 --reapply -y
   $(basename "$ENTRY") --revert
 EOF
@@ -77,8 +80,12 @@ while [ $# -gt 0 ]; do
         --ip=*)     FIRE_IP="${1#--ip=}" ;;
         --launcher) LAUNCHER_KEY="${2:-}"; shift ;;
         --launcher=*) LAUNCHER_KEY="${1#--launcher=}" ;;
-        --home-on-fire)    HOF_CHOICE=yes ;;
-        --no-home-on-fire) HOF_CHOICE=no ;;
+        --with)     ADDONS_WITH="${ADDONS_WITH:+$ADDONS_WITH,}${2:-}"; shift ;;
+        --with=*)   ADDONS_WITH="${ADDONS_WITH:+$ADDONS_WITH,}${1#--with=}" ;;
+        --without)  ADDONS_WITHOUT="${ADDONS_WITHOUT:+$ADDONS_WITHOUT,}${2:-}"; shift ;;
+        --without=*) ADDONS_WITHOUT="${ADDONS_WITHOUT:+$ADDONS_WITHOUT,}${1#--without=}" ;;
+        --home-on-fire)    ADDONS_WITH="${ADDONS_WITH:+$ADDONS_WITH,}homeonfire" ;;
+        --no-home-on-fire) ADDONS_WITHOUT="${ADDONS_WITHOUT:+$ADDONS_WITHOUT,}homeonfire" ;;
         --disable)  DISABLE_GROUPS="${2:-}"; shift ;;
         --disable=*) DISABLE_GROUPS="${1#--disable=}" ;;
         -y|--non-interactive) NONINTERACTIVE=1 ;;
@@ -176,9 +183,21 @@ launcher_keys() {
     done
 }
 
+addon_keys() {
+    local s
+    for s in $(lconf_sections); do
+        [ "$(lconf "$s" type)" = addon ] && echo "$s"
+    done
+}
+
 group_exists() {
     conf_groups | awk -F'\t' -v k="$1" '$1 == k { found = 1 } END { exit !found }'
 }
+
+# Comma-separated list helpers
+csv_items() { printf '%s' "$1" | tr ',' ' '; }
+csv_has()   { case ",$1," in *",$2,"*) return 0 ;; esac; return 1; }
+csv_add()   { if csv_has "$1" "$2"; then printf '%s' "$1"; else printf '%s' "${1:+$1,}$2"; fi; }
 
 # ------------------------------------------------------------
 # State file (what this tool changed on a given device)
@@ -478,18 +497,50 @@ install_apk() {
 }
 
 launch_app() {
-    local sec="$1" out
-    out="$(dsh am start -n "$(lconf "$sec" activity)")"
-    if printf '%s' "$out" | grep -q "Error"; then
-        out="$(dsh monkey -p "$(lconf "$sec" package)" -c android.intent.category.LEANBACK_LAUNCHER 1)"
-        if printf '%s' "$out" | grep -q "Events injected"; then
+    local sec="$1" act out
+    act="$(lconf "$sec" activity)"
+    if [ -n "$act" ]; then
+        out="$(dsh am start -n "$act")"
+        if ! printf '%s' "$out" | grep -q "Error"; then
             ok "$(lconf "$sec" name) launched"
-        else
-            warn "Could not launch $(lconf "$sec" name) automatically; open it from the Fire TV app list."
+            return 0
         fi
-    else
-        ok "$(lconf "$sec" name) launched"
     fi
+    # No activity configured, or it failed: resolve the app's leanback launcher entry instead.
+    out="$(dsh monkey -p "$(lconf "$sec" package)" -c android.intent.category.LEANBACK_LAUNCHER 1)"
+    if printf '%s' "$out" | grep -q "Events injected"; then
+        ok "$(lconf "$sec" name) launched"
+    else
+        warn "Could not launch $(lconf "$sec" name) automatically; open it from the Fire TV app list."
+    fi
+}
+
+# Disables the packages an add-on replaces (its "disables=" line), recording them for revert.
+disable_replaced_packages() {
+    local sec="$1" p pkgs="" status disabled_now
+    [ -n "$(lconf "$sec" disables)" ] || return 0
+    disabled_now="$(dsh pm list packages -d)"
+    for p in $(lconf "$sec" disables); do
+        if printf '%s\n' "$disabled_now" | grep -qx "package:$p"; then
+            info "$p is already disabled"
+        elif dsh pm path "$p" | grep -q "package:"; then
+            pkgs="$pkgs $p"
+        else
+            info "$p is not on this device"
+        fi
+    done
+    [ -n "$(printf '%s' "$pkgs" | tr -d ' ')" ] || return 0
+    while IFS=$'\t' read -r p status; do
+        [ -n "$p" ] || continue
+        if [ "$status" = disabled ]; then
+            ok "Disabled: $p (replaced by $(lconf "$sec" name))"
+            state_add_unique disabled "$p"
+        else
+            warn "Could not disable $p ($status)"
+        fi
+    done <<EOF
+$(disable_batch "$pkgs")
+EOF
 }
 
 configure_app() {
@@ -525,6 +576,7 @@ configure_app() {
         dsh cmd package set-home-activity --user 0 "$act" >/dev/null
         ok "Default home activity set"
     fi
+    disable_replaced_packages "$sec"
     launch_app "$sec"
 }
 
@@ -703,15 +755,34 @@ choose_launcher() {
     ok "Launcher: ${names[$((choice - 1))]}"
 }
 
-choose_home_on_fire() {
-    local def=n
-    [ -n "$HOF_CHOICE" ] && return
-    [ "$(lconf "$LAUNCHER_KEY" needs_home_on_fire)" = yes ] && def=y
-    say ""
-    say "  Home on Fire is a small app that redirects the Home button to your"
-    say "  launcher. It is required for Couchy and optional for launchers that"
-    say "  bring their own Home-button service (Projectivy, AT4K)."
-    if yesno "Install Home on Fire?" "$def"; then HOF_CHOICE=yes; else HOF_CHOICE=no; fi
+# Sets CHOSEN_ADDONS (comma-separated add-on keys) from --with/--without, the
+# launcher's "needs" list, each add-on's default, and Y/N prompts.
+choose_addons() {
+    local a def needs
+    CHOSEN_ADDONS=""
+    for a in $(csv_items "$ADDONS_WITH") $(csv_items "$ADDONS_WITHOUT"); do
+        [ "$(lconf "$a" type)" = addon ] || die "Unknown add-on '$a'. Known: $(addon_keys | tr '\n' ' ')"
+    done
+    needs="$(lconf "$LAUNCHER_KEY" needs)"
+    for a in $(addon_keys); do
+        csv_has "$ADDONS_WITHOUT" "$a" && continue
+        if csv_has "$ADDONS_WITH" "$a"; then
+            CHOSEN_ADDONS="$(csv_add "$CHOSEN_ADDONS" "$a")"
+            continue
+        fi
+        def=n
+        [ "$(lconf "$a" default)" = yes ] && def=y
+        case " $needs " in *" $a "*) def=y ;; esac
+        if [ "$NONINTERACTIVE" -eq 1 ]; then
+            [ "$def" = y ] && CHOSEN_ADDONS="$(csv_add "$CHOSEN_ADDONS" "$a")"
+            continue
+        fi
+        say ""
+        say "  $(lconf "$a" name): $(lconf "$a" summary)"
+        if yesno "$(lconf "$a" prompt)" "$def"; then
+            CHOSEN_ADDONS="$(csv_add "$CHOSEN_ADDONS" "$a")"
+        fi
+    done
 }
 
 # Sets CHOSEN_GROUPS (comma-separated group keys).
@@ -803,7 +874,7 @@ do_status() {
     say ""
     if [ -f "$STATE_FILE" ]; then
         say "  Saved state ($STATE_FILE):"
-        say "      launcher=$(state_get launcher) home_on_fire=$(state_get home_on_fire) groups=$(state_get groups)"
+        say "      launcher=$(state_get launcher) addons=$(state_get addons) groups=$(state_get groups)"
         say "      recorded as disabled by this tool: $(state_get disabled | grep -c .)"
     else
         say "  No saved state for this device (nothing recorded by this tool yet)."
@@ -872,7 +943,7 @@ do_install() {
     say "  RAM: $MEM_AVAIL MB available of $MEM_TOTAL MB, $PROCS Amazon processes running"
 
     choose_launcher
-    choose_home_on_fire
+    choose_addons
     choose_groups
     validate_groups "$CHOSEN_GROUPS"
     build_bloat_list
@@ -881,7 +952,7 @@ do_install() {
     if [ "$MODE" = dry-run ]; then
         banner "DRY RUN - nothing will be changed"
         say "  Launcher:        $(lconf "$LAUNCHER_KEY" name)"
-        say "  Home on Fire:    $HOF_CHOICE"
+        say "  Add-ons:         ${CHOSEN_ADDONS:-none}"
         say "  Optional groups: ${CHOSEN_GROUPS:-none}"
         say ""
         say "  Would disable ($(count_words "$PRESENT")):"
@@ -895,13 +966,13 @@ do_install() {
 
     state_set version "$VERSION"
     state_set launcher "$LAUNCHER_KEY"
-    state_set home_on_fire "$HOF_CHOICE"
+    state_set addons "$CHOSEN_ADDONS"
     state_set groups "$CHOSEN_GROUPS"
 
     setup_app "$LAUNCHER_KEY" || die "Launcher setup failed."
-    if [ "$HOF_CHOICE" = yes ]; then
-        setup_app homeonfire || die "Home on Fire setup failed."
-    fi
+    for sec in $(csv_items "$CHOSEN_ADDONS"); do
+        setup_app "$sec" || die "$(lconf "$sec" name) setup failed."
+    done
 
     if [ -n "$(printf '%s' "$PRESENT" | tr -d ' ')" ]; then
         run_disable_passes "$PRESENT"
@@ -924,7 +995,7 @@ do_install() {
 
     banner "STEP 7: Verifying"
     verify_app "$LAUNCHER_KEY"
-    [ "$HOF_CHOICE" = yes ] && verify_app homeonfire
+    for sec in $(csv_items "$CHOSEN_ADDONS"); do verify_app "$sec"; done
     say "  [OK] $(dsh pm list packages -d | grep -c 'package:') packages are disabled on the device"
 
     capture_mem
@@ -935,7 +1006,7 @@ do_install() {
 
     banner "ALL DONE"
     say "  Launcher:            $(lconf "$LAUNCHER_KEY" name)"
-    say "  Home on Fire:        $HOF_CHOICE"
+    say "  Add-ons:             ${CHOSEN_ADDONS:-none}"
     say "  Disabled this run:   $TOTAL_DISABLED (protected by Amazon: $TOTAL_PROTECTED)"
     say "  RAM freed:           $((MEM_AVAIL - before_avail)) MB"
     say ""
@@ -990,14 +1061,16 @@ do_reapply() {
         TOTAL_DISABLED=0; TOTAL_PROTECTED=0
         ok "Everything is already disabled; nothing to do."
     fi
-    local lk
+    local lk sec
     lk="$(state_get launcher)"
     if [ -n "$lk" ] && dsh pm path "$(lconf "$lk" package)" | grep -q "package:"; then
         configure_app "$lk" >/dev/null 2>&1 && ok "$(lconf "$lk" name) settings re-applied"
     fi
-    if [ "$(state_get home_on_fire)" = yes ] && dsh pm path "$(lconf homeonfire package)" | grep -q "package:"; then
-        configure_app homeonfire >/dev/null 2>&1 && ok "Home on Fire settings re-applied"
-    fi
+    for sec in $(csv_items "$(state_get addons)"); do
+        if dsh pm path "$(lconf "$sec" package)" | grep -q "package:"; then
+            configure_app "$sec" >/dev/null 2>&1 && ok "$(lconf "$sec" name) settings re-applied"
+        fi
+    done
     banner "RE-APPLY COMPLETE"
     say "  Disabled this run: $TOTAL_DISABLED (protected: $TOTAL_PROTECTED)"
 }
