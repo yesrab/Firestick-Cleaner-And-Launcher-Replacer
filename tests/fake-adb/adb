@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+DEV="${FAKE_DEV:?}"
+echo "[adb] $*" >> "$DEV/calls.log"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  version) echo "Android Debug Bridge version 1.0.41 (fake)"; exit 0 ;;
+  disconnect) echo "disconnected everything"; exit 0 ;;
+  connect) echo "$1" > "$DEV/target"; echo "connected to $1"; exit 0 ;;
+  devices) printf 'List of devices attached\n%s\tdevice\n' "$(cat "$DEV/target" 2>/dev/null || echo none)"; exit 0 ;;
+  -s) echo "$1" > "$DEV/target"; shift; cmd="$1"; shift ;;
+esac
+case "$cmd" in
+  push)
+    src="$1"; dst="$2"; mkdir -p "$DEV/fs$(dirname "$dst")"; cp "$src" "$DEV/fs$dst"
+    basename "$src" > "$DEV/last_push_src"
+    echo "$(basename "$src"): 1 file pushed, 0 skipped. 2.1 MB/s (1234 bytes in 0.001s)"; exit 0 ;;
+  shell)
+    line="$*"
+    case "$line" in
+      "echo fsc_ok") echo fsc_ok; exit 0 ;;
+      *MemTotal*) echo "MemTotal:        1540000 kB"; exit 0 ;;
+      *MemAvailable*) r=$(cat "$DEV/reboots" 2>/dev/null || echo 0); echo "MemAvailable:   $((500000 + r*120000)) kB"; exit 0 ;;
+      *"grep -c com.amazon"*) r=$(cat "$DEV/reboots" 2>/dev/null || echo 0); echo $((40 - r*12)); exit 0 ;;
+    esac
+    PATH="$DEV/bin:$PATH" FAKE_DEV="$DEV" bash -c "$line"; exit $? ;;
+  *) echo "fake adb: unhandled: $cmd $*" >&2; exit 1 ;;
+esac

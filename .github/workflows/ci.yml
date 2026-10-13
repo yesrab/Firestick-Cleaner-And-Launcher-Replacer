@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    name: Shell scripts (lint + end-to-end)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck
+      - name: shellcheck
+        run: shellcheck -s bash common/firestick-cleanup.sh mac/*.command linux/*.sh tests/run-e2e.sh
+      - name: End-to-end test against fake adb
+        run: bash tests/run-e2e.sh
+
+  powershell:
+    name: PowerShell script (parse + analyzer)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse check
+        shell: pwsh
+        run: |
+          $tokens = $null; $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/windows/Firestick-Cleaner-And-Launcher-Replacer.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count) { $errors | Format-List; exit 1 }
+          "Parsed OK"
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path windows/Firestick-Cleaner-And-Launcher-Replacer.ps1 -Severity Error,Warning `
+               -ExcludeRule PSAvoidUsingWriteHost,PSUseApprovedVerbs,PSUseSingularNouns,PSAvoidUsingPositionalParameters,PSUseShouldProcessForStateChangingFunctions
+          $r | Format-Table -AutoSize
+          if ($r | Where-Object Severity -eq 'Error') { exit 1 }
+
+  winforms:
+    name: WinForms app (build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build
+        run: dotnet build windows/WinformVer/WinformVer.csproj -c Release
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: FirestickCleanup-WinForms
+          path: windows/WinformVer/bin/Release/net48/

@@ -1,6 +1,19 @@
-firestick_cleanup.log
-ProjectivyLauncher-*.apk
+# Runtime output from the scripts
+firestick_cleanup*.log
+*.state
+.last_ip
+downloads/
+platform-tools/
+platform-tools.zip
+
+# APKs are downloaded at run time or supplied by the user; never commit them
+*.apk
 
 # .NET / WinForms build output
 **/bin/
 **/obj/
+
+# Editor / personal config
+.vscode/
+.idea/
+.DS_Store

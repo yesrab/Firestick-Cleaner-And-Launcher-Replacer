@@ -5,471 +5,764 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace FirestickCleanup
 {
+    /// <summary>
+    /// WinForms front end. The behaviour mirrors common/firestick-cleanup.sh and
+    /// windows/Firestick-Cleaner-And-Launcher-Replacer.ps1 and reads the same
+    /// common/packages.conf and common/launchers.conf files.
+    /// </summary>
     public partial class MainForm : Form
     {
-        private const string PROJECTIVY_PKG = "com.spocky.projengmenu";
-        private const string PROJECTIVY_ACTIVITY = PROJECTIVY_PKG + "/.ui.home.MainActivity";
-        private const string PROJECTIVY_ACCESSIBILITY = PROJECTIVY_PKG + "/.services.ProjectivyAccessibilityService";
-        private const string PROJECTIVY_NOTIFICATION = PROJECTIVY_PKG + "/.services.notification.NotificationListener";
-        private const string FALLBACK_APK_URL = "https://github.com/spocky/miproja1/releases/download/4.68/ProjectivyLauncher-4.68-c82-xda-release.apk";
+        private const string Version = "2.0.0";
+        private const string DeviceTmp = "/data/local/tmp";
+        private const string StockLauncher = "com.amazon.tv.launcher";
 
-        private static readonly string[] AlwaysDisabled =
-        {
-            "com.amazon.tv.acr", "com.amazon.hybridadidservice", "com.amazon.perfc", "com.amazon.perfcollection",
-            "com.amazon.device.telemetry.emitter", "com.amazon.wirelessmetrics.service",
-            "com.amazon.shoptv.client", "com.amazon.shoptv.firetv.client", "com.amazon.sneakpeek",
-            "com.amazon.ftv.screensaver", "com.amazon.storm.lightning.tutorial", "com.amazon.tmm.tutorial",
-            "com.amazon.tv.releasenotes", "com.amazon.device.rdmapplication", "com.amazon.logan",
-            "com.amazon.fireos.cirruscloud", "com.amazon.ods.kindleconnect", "com.amazon.tahoe",
-            "com.amazon.aria", "com.amazon.hedwig", "com.amazon.tv.support", "com.amazon.ceviche",
-            "com.amazon.d3", "com.amazon.tv.turnstile", "com.amazon.tv.ftvambient", "com.amazon.wifilocker",
-            "com.amazon.spiderpork", "com.amazon.tv.notificationcenter", "com.amazon.firebat",
-            "com.amazon.ssm", "com.amazon.ssmsys", "com.amazon.tv.easyupgrade", "com.amazon.dpcclient",
-            "com.amazon.sharingservice.android.client.proxy", "com.amazon.privacypassservice",
-            "com.amazon.tv.legal.notices"
-        };
-
-        private static readonly string[] VideoServices =
-        {
-            "com.amazon.avls.experience", "com.amazon.prism.android.service", "com.amazon.dp.logger",
-            "com.amazon.livedeviceservice", "com.amazon.rtcsessioncontroller", "com.amazon.client.metrics.api"
-        };
-
+        private readonly string baseDir;
         private readonly string adbPath;
         private readonly string logFile;
+        private readonly string lastIpFile;
+        private readonly string downloadDir;
+
+        private List<GroupDef> groups = new List<GroupDef>();
+        private List<AppDef> apps = new List<AppDef>();
+        private readonly Dictionary<string, CheckBox> groupBoxes = new Dictionary<string, CheckBox>();
+
+        // Per-run state (set by StartRun on the UI thread before the background work begins).
+        private string ip;
+        private string target;
+        private StateFile state;
+
+        private sealed class Choices
+        {
+            public AppDef Launcher;
+            public bool HomeOnFire;
+            public List<string> Groups = new List<string>();
+        }
 
         public MainForm()
         {
             InitializeComponent();
-            adbPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "adb", "adb.exe");
-            logFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "firestick_cleanup.log");
+            baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            adbPath = Path.Combine(baseDir, "adb", "adb.exe");
+            logFile = Path.Combine(baseDir, "firestick_cleanup_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".log");
+            lastIpFile = Path.Combine(baseDir, ".last_ip");
+            downloadDir = Path.Combine(baseDir, "downloads");
+            Load += MainForm_Load;
         }
 
-        private async void BtnStart_Click(object sender, EventArgs e)
+        // ------------------------------------------------------------
+        // UI setup
+        // ------------------------------------------------------------
+        private void MainForm_Load(object sender, EventArgs e)
         {
-            string ip = txtDeviceIP.Text.Trim();
-            if (!IsValidIP(ip))
+            Text = "Firestick Cleanup " + Version;
+            string commonDir = Path.Combine(baseDir, "common");
+            try
             {
-                MessageBox.Show("Enter a valid IPv4 address (e.g. 10.0.0.20).", "Invalid IP", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                groups = Conf.LoadGroups(Path.Combine(commonDir, "packages.conf"));
+                apps = Conf.LoadApps(Path.Combine(commonDir, "launchers.conf"));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Could not read the config files in " + commonDir + ":\n" + ex.Message,
+                    "Config missing", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Close();
                 return;
+            }
+
+            cmbLauncher.Items.Clear();
+            foreach (var app in apps.Where(a => a.IsLauncher)) cmbLauncher.Items.Add(app);
+            if (cmbLauncher.Items.Count > 0) cmbLauncher.SelectedIndex = 0;
+
+            pnlOptions.Controls.Clear();
+            groupBoxes.Clear();
+            foreach (var g in groups)
+            {
+                if (g.Key == "always") continue;
+                var cb = new CheckBox { Text = g.ShortPrompt, AutoSize = true, Tag = g, Margin = new Padding(4, 2, 4, 2) };
+                toolTip.SetToolTip(cb, g.Prompt + "\n\n" + string.Join("\n", g.Packages));
+                pnlOptions.Controls.Add(cb);
+                groupBoxes[g.Key] = cb;
+            }
+
+            try { if (File.Exists(lastIpFile)) txtDeviceIP.Text = File.ReadAllLines(lastIpFile).FirstOrDefault() ?? ""; } catch { }
+        }
+
+        private void CmbLauncher_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            var app = cmbLauncher.SelectedItem as AppDef;
+            if (app == null) return;
+            lblLauncherSummary.Text = app.Summary;
+            chkHomeOnFire.Checked = app.NeedsHomeOnFire;
+        }
+
+        private Choices ReadChoices()
+        {
+            var c = new Choices { Launcher = cmbLauncher.SelectedItem as AppDef, HomeOnFire = chkHomeOnFire.Checked };
+            foreach (var kv in groupBoxes) if (kv.Value.Checked) c.Groups.Add(kv.Key);
+            return c;
+        }
+
+        private bool StartRun()
+        {
+            string raw = txtDeviceIP.Text.Trim();
+            int port = 5555;
+            var m = Regex.Match(raw, @"^(.+):(\d+)$");
+            if (m.Success) { raw = m.Groups[1].Value; port = int.Parse(m.Groups[2].Value); }
+            if (!Regex.IsMatch(raw, @"^(\d{1,3}\.){3}\d{1,3}$") && !Regex.IsMatch(raw, @"^[A-Za-z0-9][A-Za-z0-9.-]*$"))
+            {
+                MessageBox.Show("Enter a valid IPv4 address or host name (e.g. 10.0.0.20).", "Invalid address", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
             }
             if (!File.Exists(adbPath))
             {
-                MessageBox.Show($"ADB not found at:\n{adbPath}", "ADB missing", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
+                MessageBox.Show("ADB not found at:\n" + adbPath, "ADB missing", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
             }
-
+            ip = raw;
+            target = raw + ":" + port;
+            state = new StateFile(Path.Combine(baseDir, "firestick_cleanup_" + raw + ".state"));
             ResetLog();
             SetButtons(false);
-            try
-            {
-                await Task.Run(() => RunCleanupAsync(ip));
-            }
+            return true;
+        }
+
+        private async Task RunGuarded(Func<Task> work)
+        {
+            try { await Task.Run(work); }
             catch (Exception ex)
             {
                 Log("[!!] " + ex.Message);
                 SetStatus("Error: " + ex.Message);
                 MessageBox.Show(ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-            finally
-            {
-                SetButtons(true);
-            }
+            finally { SetButtons(true); }
+        }
+
+        private async void BtnStart_Click(object sender, EventArgs e)
+        {
+            if (!StartRun()) return;
+            var choices = ReadChoices();
+            await RunGuarded(() => RunInstallAsync(choices));
+        }
+
+        private async void BtnReapply_Click(object sender, EventArgs e)
+        {
+            if (!StartRun()) return;
+            var choices = ReadChoices();
+            await RunGuarded(() => RunReapplyAsync(choices));
+        }
+
+        private async void BtnStatus_Click(object sender, EventArgs e)
+        {
+            if (!StartRun()) return;
+            await RunGuarded(RunStatusAsync);
         }
 
         private async void BtnRevert_Click(object sender, EventArgs e)
         {
-            string ip = txtDeviceIP.Text.Trim();
-            if (!IsValidIP(ip))
-            {
-                MessageBox.Show("Enter a valid IPv4 address (e.g. 10.0.0.20).", "Invalid IP", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-            if (!File.Exists(adbPath))
-            {
-                MessageBox.Show($"ADB not found at:\n{adbPath}", "ADB missing", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
-            }
-            if (MessageBox.Show("Re-enable all disabled packages, remove Projectivy, and restore stock settings?",
-                    "Revert", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
-
-            ResetLog();
-            SetButtons(false);
-            try
-            {
-                await Task.Run(() => RunRevertAsync(ip));
-            }
-            catch (Exception ex)
-            {
-                Log("[!!] " + ex.Message);
-                SetStatus("Error: " + ex.Message);
-            }
-            finally
-            {
-                SetButtons(true);
-            }
+            if (!StartRun()) return;
+            await RunGuarded(RunRevertAsync);
         }
 
-        private async Task RunCleanupAsync(string ip)
+        // ------------------------------------------------------------
+        // Modes
+        // ------------------------------------------------------------
+        private async Task RunInstallAsync(Choices c)
+        {
+            if (c.Launcher == null) { Log("[!!] No launcher selected."); return; }
+            SetProgress(0, "Connecting...");
+            if (!await ConnectAsync()) return;
+
+            SetProgress(8, "Capturing baseline RAM...");
+            var before = await CaptureMemAsync();
+            Log($"  RAM: {before.avail} MB available of {before.total} MB, {before.procs} Amazon processes running");
+
+            state.Set("version", Version);
+            state.Set("launcher", c.Launcher.Key);
+            state.Set("home_on_fire", c.HomeOnFire ? "yes" : "no");
+            state.Set("groups", string.Join(",", c.Groups));
+
+            SetProgress(15, "Installing " + c.Launcher.Name + "...");
+            if (!await SetupAppAsync(c.Launcher)) { SetStatus("Launcher setup failed."); return; }
+
+            var hof = apps.FirstOrDefault(a => a.Key == "homeonfire");
+            if (c.HomeOnFire && hof != null)
+            {
+                SetProgress(40, "Installing Home on Fire...");
+                if (!await SetupAppAsync(hof)) { SetStatus("Home on Fire setup failed."); return; }
+            }
+
+            SetProgress(55, "Disabling bloatware...");
+            var bloat = BuildBloatList(c.Groups);
+            var split = await ClassifyAsync(bloat);
+            int totalDisabled = 0, totalProtected = 0, passes = 0;
+            if (split.present.Count > 0)
+            {
+                var r = await DisablePassesAsync(split.present);
+                totalDisabled = r.disabled; totalProtected = r.protectedCount; passes = r.passes;
+            }
+            else Log("  [..] Nothing new to disable.");
+            if (split.absent.Count > 0) Log($"  [..] {split.absent.Count} packages are not on this device and were skipped.");
+
+            if (passes <= 1)
+            {
+                SetProgress(80, "Rebooting to apply changes...");
+                if (!await RebootAndReconnectAsync()) { Log("  [!!] Could not reconnect after reboot."); return; }
+            }
+            int reapplied = await ReapplyDisabledAsync();
+            Log(reapplied > 0 ? $"  [OK] Re-disabled {reapplied} packages that came back after the reboot"
+                              : "  [OK] All packages stayed disabled after the reboot");
+
+            SetProgress(92, "Verifying...");
+            await VerifyAppAsync(c.Launcher);
+            if (c.HomeOnFire && hof != null) await VerifyAppAsync(hof);
+            Log($"  [OK] {(await DisabledNowAsync()).Count} packages are disabled on the device");
+
+            var after = await CaptureMemAsync();
+            int freed = after.avail - before.avail;
+            Log("");
+            Log("                    BEFORE      AFTER");
+            Log($"  Available RAM:    {before.avail,4} MB    {after.avail,4} MB   (+{freed} MB freed)");
+            Log($"  Amazon processes: {before.procs,4}        {after.procs,4}       (-{before.procs - after.procs})");
+            Log("");
+            Log($"  ALL DONE: {c.Launcher.Name}, Home on Fire {(c.HomeOnFire ? "yes" : "no")}, {totalDisabled} packages disabled ({totalProtected} protected), {freed} MB freed.");
+            Log($"  State saved to {state.Path}. Use Re-apply after a Fire OS update, Revert to undo.");
+            SetProgress(100, $"Done: {totalDisabled} packages disabled, {freed} MB freed.");
+        }
+
+        private async Task RunReapplyAsync(Choices c)
         {
             SetProgress(0, "Connecting...");
-            await RunAdb($"disconnect");
-            if (!await ConnectAsync(ip)) return;
+            if (!await ConnectAsync()) return;
+            var groupsToUse = state.Exists && c.Groups.Count == 0
+                ? state.Get("groups").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).ToList()
+                : c.Groups;
+            Log("  [..] Groups: " + (groupsToUse.Count > 0 ? string.Join(",", groupsToUse) : "none"));
+            state.Set("groups", string.Join(",", groupsToUse));
 
-            SetProgress(10, "Capturing baseline RAM...");
-            var (totalBefore, availBefore, procsBefore) = await CaptureMemAsync(ip);
-            Log($"  Total RAM: {totalBefore} MB | Available: {availBefore} MB | Amazon procs: {procsBefore}");
+            SetProgress(20, "Disabling bloatware...");
+            var split = await ClassifyAsync(BuildBloatList(groupsToUse));
+            int disabled = 0, prot = 0;
+            if (split.present.Count > 0)
+            {
+                var r = await DisablePassesAsync(split.present);
+                disabled = r.disabled; prot = r.protectedCount;
+                if (r.passes <= 1 && r.disabled > 0)
+                {
+                    SetProgress(70, "Rebooting to apply changes...");
+                    if (!await RebootAndReconnectAsync()) { Log("  [!!] Could not reconnect after reboot."); return; }
+                    await ReapplyDisabledAsync();
+                }
+            }
+            else Log("  [OK] Everything is already disabled; nothing to do.");
 
-            SetProgress(20, "Downloading Projectivy...");
-            string apkLocal = await DownloadProjectivyAsync();
-            if (apkLocal == null) { Log("[!!] Download failed."); SetStatus("Download failed."); return; }
-
-            SetProgress(35, "Installing Projectivy...");
-            if (!await InstallProjectivyAsync(ip, apkLocal)) { SetStatus("Install failed."); return; }
-
-            SetProgress(50, "Configuring Projectivy as launcher...");
-            await ConfigureProjectivyAsync(ip);
-
-            ShowMessage(
-                "On your Fire TV:\n\n" +
-                "1. Projectivy should now be on your screen\n" +
-                "2. Open Projectivy Settings (long-press center button)\n" +
-                "3. Select 'General'\n" +
-                "4. Enable 'Override current launcher'\n\n" +
-                "Click OK here once done.",
-                "Configure Projectivy");
-
-            SetProgress(60, "Disabling bloatware...");
-            int totalDisabled = await DisableBloatLoopAsync(ip, BuildBloatList());
-
-            SetProgress(95, "Verifying...");
-            await VerifyAsync(ip);
-
-            var (totalAfter, availAfter, procsAfter) = await CaptureMemAsync(ip);
-            int freed = availAfter - availBefore;
-            int killed = procsBefore - procsAfter;
-
-            Log("");
-            Log("                    BEFORE      AFTER     CHANGE");
-            Log("  ----------------------------------------------------");
-            Log($"  Available RAM:    {availBefore,4} MB    {availAfter,4} MB   +{freed} MB freed");
-            Log($"  Amazon processes: {procsBefore,4}        {procsAfter,4}       -{killed} removed");
-            Log("");
-            Log($"  ALL DONE — {totalDisabled} packages disabled, {freed} MB freed.");
-
-            SetProgress(100, $"Done — {totalDisabled} packages disabled, {freed} MB freed.");
-            try { File.Delete(apkLocal); } catch { }
+            SetProgress(85, "Re-applying launcher settings...");
+            var launcher = apps.FirstOrDefault(a => a.Key == state.Get("launcher"));
+            if (launcher != null && await IsInstalledAsync(launcher.Package))
+            {
+                if (await ConfigureAppAsync(launcher)) Log($"  [OK] {launcher.Name} settings re-applied");
+            }
+            var hof = apps.FirstOrDefault(a => a.Key == "homeonfire");
+            if (state.Get("home_on_fire") == "yes" && hof != null && await IsInstalledAsync(hof.Package))
+            {
+                if (await ConfigureAppAsync(hof)) Log("  [OK] Home on Fire settings re-applied");
+            }
+            SetProgress(100, $"Re-apply complete: {disabled} disabled, {prot} protected.");
         }
 
-        private async Task RunRevertAsync(string ip)
+        private async Task RunStatusAsync()
         {
             SetProgress(0, "Connecting...");
-            if (!await ConnectAsync(ip)) return;
-
-            SetProgress(20, "Re-enabling disabled packages...");
-            var (_, listOut) = await RunAdb($"-s {ip}:5555 shell pm list packages -d");
-            var disabled = Regex.Matches(listOut ?? "", @"package:(\S+)")
-                .Cast<Match>().Select(m => m.Groups[1].Value).ToList();
-            int reEnabled = 0;
-            foreach (var pkg in disabled)
+            if (!await ConnectAsync()) return;
+            SetProgress(50, "Reading device state...");
+            string acc = (await DshAsync("settings", "get", "secure", "enabled_accessibility_services")).Trim();
+            string role = (await DshAsync("cmd", "role", "get-role-holders", "android.app.role.HOME")).Trim();
+            var disabled = await DisabledNowAsync();
+            foreach (var app in apps)
             {
-                await RunAdb($"-s {ip}:5555 shell pm enable {pkg}");
-                Log($"  [OK] Enabled: {pkg}");
-                reEnabled++;
+                if (await IsInstalledAsync(app.Package))
+                {
+                    string extra = "";
+                    if (acc.Contains(app.Package)) extra += ", accessibility service on";
+                    if (role.Contains(app.Package)) extra += ", holds HOME role";
+                    Log($"  [OK] {app.Name}: installed{extra}");
+                }
+                else Log($"  [--] {app.Name}: not installed");
             }
-
-            SetProgress(60, "Removing Projectivy launcher settings...");
-            await RunAdb($"-s {ip}:5555 shell settings put secure enabled_accessibility_services \"\"");
-            await RunAdb($"-s {ip}:5555 shell settings put secure accessibility_enabled 0");
-            await RunAdb($"-s {ip}:5555 shell settings put secure enabled_notification_listeners \"\"");
-            await RunAdb($"-s {ip}:5555 shell appops set {PROJECTIVY_PKG} SYSTEM_ALERT_WINDOW deny");
-            await RunAdb($"-s {ip}:5555 shell cmd role remove-role-holder android.app.role.HOME {PROJECTIVY_PKG}");
-
-            SetProgress(85, "Uninstalling Projectivy...");
-            var (_, uninst) = await RunAdb($"-s {ip}:5555 shell pm uninstall {PROJECTIVY_PKG}");
-            Log(uninst.Contains("Success") ? "  [OK] Projectivy uninstalled" : "  [--] Projectivy was not installed");
-
-            SetProgress(100, $"Revert complete — {reEnabled} packages re-enabled.");
-            Log($"  ALL DONE — {reEnabled} packages re-enabled.");
+            Log("");
+            Log("  HOME role holder:        " + (role.Length > 0 ? role : "unknown"));
+            Log("  Accessibility services:  " + (acc.Length > 0 && acc != "null" ? acc : "none"));
+            Log("  Disabled packages:       " + disabled.Count);
+            foreach (var d in disabled) Log("      " + d);
+            Log("");
+            if (state.Exists)
+            {
+                Log($"  Saved state ({state.Path}):");
+                Log($"      launcher={state.Get("launcher")} home_on_fire={state.Get("home_on_fire")} groups={state.Get("groups")}");
+                Log($"      recorded as disabled by this tool: {state.GetAll("disabled").Count}");
+            }
+            else Log("  No saved state for this device (nothing recorded by this tool yet).");
+            SetProgress(100, "Status read.");
         }
 
-        private async Task<bool> ConnectAsync(string ip)
+        private async Task RunRevertAsync()
         {
-            await RunAdb($"connect {ip}:5555");
-            ShowMessage(
-                "On your Fire TV: select 'Always allow from this computer' and press OK.\n\n" +
-                "Click OK here once you've authorized the connection.",
-                "Authorize ADB");
-            await RunAdb($"connect {ip}:5555");
-            await Task.Delay(2000);
-
-            var (_, output) = await RunAdb($"-s {ip}:5555 shell echo ok");
-            if (output.Contains("ok"))
+            List<string> pkgs;
+            if (state.Exists)
             {
-                Log($"  [OK] Connected to {ip}:5555");
-                return true;
+                if (!Confirm("Re-enable the packages this tool disabled, remove the launcher and Home on Fire, and restore stock settings?", "Revert")) { SetButtons(true); return; }
             }
-            Log("  [!!] Could not connect. Check that ADB Debugging is enabled and that you authorized the connection.");
+            else
+            {
+                if (!Confirm("No saved state was found for this device.\n\nRevert will re-enable EVERY disabled package, including any you disabled yourself, and remove all known launchers. Continue?", "Revert")) { SetButtons(true); return; }
+            }
+            SetProgress(0, "Connecting...");
+            if (!await ConnectAsync()) return;
+
+            pkgs = state.Exists ? state.GetAll("disabled") : await DisabledNowAsync();
+            SetProgress(20, "Re-enabling packages...");
+            if (pkgs.Count > 0)
+            {
+                Log($"  [..] Re-enabling {pkgs.Count} packages...");
+                foreach (var kv in await EnableBatchAsync(pkgs))
+                    Log(kv.Value ? $"  [OK] Enabled: {kv.Key}" : $"  [--] Could not enable: {kv.Key}");
+            }
+            else Log("  [..] No packages to re-enable.");
+
+            SetProgress(60, "Restoring settings...");
+            await RestoreSecureSettingAsync("enabled_accessibility_services");
+            await RestoreSecureSettingAsync("enabled_notification_listeners");
+            string accNow = (await DshAsync("settings", "get", "secure", "enabled_accessibility_services")).Trim();
+            if (accNow.Length == 0 || accNow == "null") await DshAsync("settings", "put", "secure", "accessibility_enabled", "0");
+            Log("  [OK] Accessibility and notification listener settings restored");
+
+            SetProgress(75, "Removing apps...");
+            var toRemove = state.Exists ? state.GetAll("installed") : apps.Select(a => a.Package).ToList();
+            foreach (var pkg in toRemove)
+            {
+                if (!await IsInstalledAsync(pkg)) continue;
+                await DshAsync("appops", "set", pkg, "SYSTEM_ALERT_WINDOW", "default");
+                await DshAsync("cmd", "role", "remove-role-holder", "android.app.role.HOME", pkg);
+                var un = await DshAsync("pm", "uninstall", pkg);
+                Log(un.Contains("Success") ? $"  [OK] Uninstalled: {pkg}" : $"  [--] Could not uninstall {pkg}");
+            }
+            await DshAsync("cmd", "role", "add-role-holder", "android.app.role.HOME", StockLauncher);
+            Log("  [OK] HOME role returned to the Amazon launcher");
+            state.Delete();
+            SetProgress(100, "Revert complete.");
+        }
+
+        // ------------------------------------------------------------
+        // Connection and device helpers
+        // ------------------------------------------------------------
+        private async Task<bool> ConnectAsync()
+        {
+            await RunAdb("disconnect");
+            Log("  [..] Sending connection request (accept the prompt on your TV if it appears)...");
+            var sw = Stopwatch.StartNew();
+            bool hinted = false;
+            while (sw.Elapsed.TotalSeconds < 120)
+            {
+                await RunAdb("connect", target);
+                string st = await DeviceStateAsync();
+                if (st == "device")
+                {
+                    if ((await DshAsync("echo", "fsc_ok")).Contains("fsc_ok"))
+                    {
+                        Log($"  [OK] Connected to {target}");
+                        try { File.WriteAllText(lastIpFile, ip); } catch { }
+                        return true;
+                    }
+                }
+                else if (st == "unauthorized" && !hinted)
+                {
+                    hinted = true;
+                    SetStatus("Waiting for you to accept the prompt on the TV...");
+                    Log("  Look at your TV: select 'Always allow from this computer' and press OK.");
+                }
+                await Task.Delay(2000);
+            }
+            Log("  [!!] Could not connect. Check the network, that ADB Debugging is enabled, and that you accepted the prompt on the TV.");
             SetStatus("Connection failed.");
             return false;
         }
 
-        private async Task<(int total, int avail, int procs)> CaptureMemAsync(string ip)
+        private async Task<string> DeviceStateAsync()
         {
-            var (_, total) = await RunAdb($"-s {ip}:5555 shell \"cat /proc/meminfo | grep MemTotal\"");
-            var (_, avail) = await RunAdb($"-s {ip}:5555 shell \"cat /proc/meminfo | grep MemAvailable\"");
-            var (_, procs) = await RunAdb($"-s {ip}:5555 shell \"ps -A | grep com.amazon | wc -l\"");
-
-            int totalMB = ParseKbToMb(total);
-            int availMB = ParseKbToMb(avail);
-            int procCount = int.TryParse((procs ?? "0").Trim(), out var n) ? n : 0;
-            return (totalMB, availMB, procCount);
+            var (_, output) = await RunAdb("devices");
+            foreach (var line in output.Split('\n'))
+            {
+                var m = Regex.Match(line, "^" + Regex.Escape(target) + @"\s+(\S+)");
+                if (m.Success) return m.Groups[1].Value;
+            }
+            return "";
         }
 
-        private async Task<string> DownloadProjectivyAsync()
+        private async Task<bool> RebootAndReconnectAsync()
         {
-            string apkPath = Path.Combine(Path.GetTempPath(), "ProjectivyLauncher-latest.apk");
-            string apkUrl = FALLBACK_APK_URL;
-
-            try
+            Log("  [..] Rebooting Fire TV...");
+            await DshAsync("reboot");
+            await Task.Delay(20000);
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed.TotalSeconds < 180)
             {
-                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-                using (var http = new HttpClient())
+                await RunAdb("connect", target);
+                if (await DeviceStateAsync() == "device" && (await DshAsync("echo", "fsc_ok")).Contains("fsc_ok"))
                 {
-                    http.DefaultRequestHeaders.UserAgent.ParseAdd("Firestick-Cleanup/1.2");
-                    string json = await http.GetStringAsync("https://api.github.com/repos/spocky/miproja1/releases/latest");
-                    var m = Regex.Match(json, @"""browser_download_url"":\s*""([^""]+\.apk)""");
-                    if (m.Success) apkUrl = m.Groups[1].Value;
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"  [..] Could not query GitHub API ({ex.Message}). Using fallback URL.");
-            }
-
-            Log($"  [..] Downloading: {apkUrl}");
-            try
-            {
-                using (var http = new HttpClient())
-                using (var resp = await http.GetAsync(apkUrl, HttpCompletionOption.ResponseHeadersRead))
-                {
-                    resp.EnsureSuccessStatusCode();
-                    using (var src = await resp.Content.ReadAsStreamAsync())
-                    using (var dst = File.Create(apkPath))
-                    {
-                        await src.CopyToAsync(dst);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"  [!!] Download failed: {ex.Message}");
-                return null;
-            }
-
-            var fi = new FileInfo(apkPath);
-            if (!fi.Exists || fi.Length < 100000)
-            {
-                Log("  [!!] Downloaded file is too small.");
-                return null;
-            }
-            Log($"  [OK] Downloaded ({fi.Length / 1048576} MB)");
-            return apkPath;
-        }
-
-        private async Task<bool> InstallProjectivyAsync(string ip, string apkLocal)
-        {
-            Log("  [..] Pushing APK to device...");
-            var (_, push) = await RunAdb($"-s {ip}:5555 push \"{apkLocal}\" /data/local/tmp/projectivy.apk");
-            if (!push.Contains("pushed"))
-            {
-                Log("  [!!] Failed to push APK.");
-                Log(push);
-                return false;
-            }
-            Log("  [OK] APK pushed");
-
-            Log("  [..] Installing...");
-            var (_, inst) = await RunAdb($"-s {ip}:5555 shell pm install -r /data/local/tmp/projectivy.apk");
-            if (!inst.Contains("Success"))
-            {
-                Log("  [!!] Install failed.");
-                Log(inst);
-                return false;
-            }
-
-            var (_, path) = await RunAdb($"-s {ip}:5555 shell pm path {PROJECTIVY_PKG}");
-            if (!path.Contains("package:"))
-            {
-                Log("  [!!] Install reported success but package not found on device.");
-                return false;
-            }
-            Log("  [OK] Projectivy installed and verified");
-
-            await RunAdb($"-s {ip}:5555 shell rm /data/local/tmp/projectivy.apk");
-            return true;
-        }
-
-        private async Task ConfigureProjectivyAsync(string ip)
-        {
-            await RunAdb($"-s {ip}:5555 shell settings put secure enabled_accessibility_services {PROJECTIVY_ACCESSIBILITY}");
-            await RunAdb($"-s {ip}:5555 shell settings put secure accessibility_enabled 1");
-            var (_, accCheck) = await RunAdb($"-s {ip}:5555 shell settings get secure enabled_accessibility_services");
-            Log(accCheck.Contains(PROJECTIVY_PKG) ? "  [OK] Accessibility service enabled" : "  [!!] Accessibility service not enabled");
-
-            await RunAdb($"-s {ip}:5555 shell settings put secure enabled_notification_listeners {PROJECTIVY_NOTIFICATION}");
-            Log("  [OK] Notification listener enabled");
-
-            await RunAdb($"-s {ip}:5555 shell appops set {PROJECTIVY_PKG} SYSTEM_ALERT_WINDOW allow");
-            Log("  [OK] Overlay permission granted");
-
-            await RunAdb($"-s {ip}:5555 shell cmd role add-role-holder android.app.role.HOME {PROJECTIVY_PKG}");
-            Log("  [OK] HOME role assigned");
-
-            var (_, launch) = await RunAdb($"-s {ip}:5555 shell am start -n {PROJECTIVY_ACTIVITY}");
-            if (launch.Contains("Error"))
-            {
-                Log("  [..] Direct launch failed, trying monkey...");
-                var (_, monkey) = await RunAdb($"-s {ip}:5555 shell monkey -p {PROJECTIVY_PKG} -c android.intent.category.LEANBACK_LAUNCHER 1");
-                Log(monkey.Contains("Events injected") ? "  [OK] Projectivy launched via fallback" : "  [!!] Could not auto-launch — open it manually on the TV");
-            }
-            else Log("  [OK] Projectivy launched");
-        }
-
-        private List<string> BuildBloatList()
-        {
-            var list = new List<string>(AlwaysDisabled);
-            if (chkVideoServices.Checked) list.AddRange(VideoServices);
-            if (chkAppstore.Checked) list.Add("com.amazon.venezia");
-            if (chkPhotos.Checked) list.Add("com.amazon.bueller.photos");
-            if (chkMusic.Checked) list.Add("com.amazon.bueller.music");
-            if (chkFreevee.Checked) list.Add("com.amazon.imdb.tv.android.app");
-            if (chkMinitv.Checked) list.Add("com.amazon.minitv.android.app");
-            if (chkGames.Checked) list.Add("com.amazon.gamehub");
-            if (chkLivetv.Checked) list.Add("com.amazon.tv.livetv");
-            if (chkAlexa.Checked) { list.Add("com.amazon.tv.alexaalerts"); list.Add("com.amazon.tv.alexanotifications"); list.Add("com.amazon.audiohome"); }
-            if (chkSilk.Checked) list.Add("com.amazon.cloud9");
-            if (chkSmarthome.Checked) list.Add("com.amazon.smarthomemapviewapp");
-            if (chkCast.Checked) list.Add("com.amazon.whisperplay.service.install");
-            return list;
-        }
-
-        private async Task<int> DisableBloatLoopAsync(string ip, List<string> bloat)
-        {
-            var done = new HashSet<string>();
-            int totalDisabled = 0;
-            int pass = 0;
-
-            while (true)
-            {
-                pass++;
-                Log("");
-                Log($"=== Disable pass {pass} ===");
-                int passDisabled = 0, passProtected = 0;
-
-                foreach (var pkg in bloat)
-                {
-                    if (done.Contains(pkg)) continue;
-                    var (_, output) = await RunAdb($"-s {ip}:5555 shell pm disable-user --user 0 {pkg}");
-                    if (output.Contains("disabled-user"))
-                    {
-                        Log($"  [OK] Disabled: {pkg}");
-                        done.Add(pkg);
-                        passDisabled++;
-                        totalDisabled++;
-                    }
-                    else if (output.Contains("SecurityException"))
-                    {
-                        Log($"  [--] Protected: {pkg}");
-                        passProtected++;
-                    }
-                    else
-                    {
-                        Log($"  [--] Skipped: {pkg} (not found)");
-                        done.Add(pkg);
-                    }
-                }
-                Log($"  Pass {pass}: disabled {passDisabled}, protected {passProtected}");
-
-                bool needRetry = passDisabled > 0 && passProtected > 0 && pass < 3;
-                if (!needRetry) break;
-
-                Log("  [..] Some protected — rebooting to retry...");
-                if (!await RebootAndReconnectAsync(ip))
-                {
-                    Log("  [!!] Could not reconnect. Continuing.");
-                    break;
-                }
-            }
-
-            if (pass == 1)
-            {
-                Log("");
-                Log("[..] Final reboot to apply changes...");
-                if (!await RebootAndReconnectAsync(ip))
-                {
-                    Log("  [!!] Could not reconnect after reboot.");
-                    return totalDisabled;
-                }
-            }
-
-            Log("[..] Re-applying any packages Amazon re-enabled during reboot...");
-            var (_, listOut) = await RunAdb($"-s {ip}:5555 shell pm list packages -d");
-            int reapplied = 0;
-            foreach (var pkg in done)
-            {
-                if (!listOut.Contains($"package:{pkg}"))
-                {
-                    var (_, retryOut) = await RunAdb($"-s {ip}:5555 shell pm disable-user --user 0 {pkg}");
-                    if (retryOut.Contains("disabled-user")) reapplied++;
-                }
-            }
-            Log(reapplied > 0 ? $"  [OK] Re-disabled {reapplied} packages" : "  [OK] All packages stayed disabled");
-            return totalDisabled;
-        }
-
-        private async Task<bool> RebootAndReconnectAsync(string ip)
-        {
-            await RunAdb($"-s {ip}:5555 shell reboot");
-            await Task.Delay(35_000);
-            for (int i = 1; i <= 20; i++)
-            {
-                await RunAdb($"connect {ip}:5555");
-                var (_, output) = await RunAdb($"-s {ip}:5555 shell echo ok");
-                if (output.Contains("ok"))
-                {
-                    await Task.Delay(5_000);
-                    Log("  [OK] Device back online");
+                    await Task.Delay(5000);
+                    Log("  [OK] Device is back online");
                     return true;
                 }
-                Log($"  [..] Waiting for reboot... ({i}/20)");
-                await Task.Delay(3_000);
+                await Task.Delay(2000);
             }
             return false;
         }
 
-        private async Task VerifyAsync(string ip)
+        private async Task<(int total, int avail, int procs)> CaptureMemAsync()
         {
-            var (_, pkgs) = await RunAdb($"-s {ip}:5555 shell pm list packages");
-            Log(pkgs.Contains(PROJECTIVY_PKG) ? "  [OK] Projectivy is installed" : "  [!!] Projectivy is NOT installed");
-
-            var (_, acc) = await RunAdb($"-s {ip}:5555 shell settings get secure enabled_accessibility_services");
-            Log(acc.Contains(PROJECTIVY_PKG) ? "  [OK] Accessibility service active" : "  [!!] Accessibility service NOT active");
-
-            var (_, disabled) = await RunAdb($"-s {ip}:5555 shell pm list packages -d");
-            int count = Regex.Matches(disabled ?? "", @"package:").Count;
-            Log($"  [OK] {count} packages remain disabled");
+            string t = await DshAsync("grep MemTotal /proc/meminfo");
+            string a = await DshAsync("grep MemAvailable /proc/meminfo");
+            string p = await DshAsync("(ps -A 2>/dev/null || ps) | grep -c com.amazon");
+            int procs = 0;
+            var m = Regex.Match(p, @"\d+");
+            if (m.Success) int.TryParse(m.Value, out procs);
+            return (ParseKbToMb(t), ParseKbToMb(a), procs);
         }
 
-        private async Task<(int code, string output)> RunAdb(string args, int timeoutMs = 60000)
+        private async Task<bool> IsInstalledAsync(string pkg) => (await DshAsync("pm", "path", pkg)).Contains("package:");
+
+        private async Task<List<string>> DisabledNowAsync()
         {
-            File.AppendAllText(logFile, $"[adb] {args}{Environment.NewLine}");
+            var output = await DshAsync("pm", "list", "packages", "-d");
+            return output.Split('\n').Select(l => l.Trim()).Where(l => l.StartsWith("package:")).Select(l => l.Substring(8)).ToList();
+        }
+
+        private async Task EnableSecureListAsync(string setting, string component, string pkg)
+        {
+            string cur = (await DshAsync("settings", "get", "secure", setting)).Trim();
+            if (cur == "null") cur = "";
+            if (!state.Has("prev_" + setting)) state.Set("prev_" + setting, cur);
+            string next;
+            if (cur.Contains(pkg + "/")) next = cur;
+            else if (cur.Length == 0) next = component;
+            else next = cur + ":" + component;
+            if (next != cur) await DshAsync("settings", "put", "secure", setting, next);
+        }
+
+        private async Task RestoreSecureSettingAsync(string setting)
+        {
+            if (state.Has("prev_" + setting))
+            {
+                string prev = state.Get("prev_" + setting);
+                if (prev.Length == 0) await DshAsync("settings", "delete", "secure", setting);
+                else await DshAsync("settings", "put", "secure", setting, prev);
+            }
+            else await DshAsync("settings", "delete", "secure", setting);
+        }
+
+        // ------------------------------------------------------------
+        // APK download / install / configure
+        // ------------------------------------------------------------
+        private async Task<string> FetchApkAsync(AppDef app)
+        {
+            foreach (var glob in app.ApkGlobs)
+            {
+                var local = Directory.GetFiles(baseDir, glob).FirstOrDefault();
+                if (local != null) { Log("  [OK] Using local APK: " + Path.GetFileName(local)); return local; }
+            }
+            if (app.Source.StartsWith("manual:"))
+            {
+                Log($"  [!!] {app.Name} has to be downloaded by hand from {app.Source.Substring(7)}");
+                Log($"       Save the APK in: {baseDir}");
+                Log($"       Accepted file names: {string.Join(" ", app.ApkGlobs)}");
+                ShowMessage($"{app.Name} is not bundled and cannot be downloaded automatically.\n\nDownload it from {app.Source.Substring(7)} and save it in:\n{baseDir}\n\nAccepted file names: {string.Join(" ", app.ApkGlobs)}", "APK needed");
+                return null;
+            }
+            if (!app.Source.StartsWith("github:")) { Log("  [!!] Unknown source for " + app.Name); return null; }
+
+            Log($"  [..] Fetching latest {app.Name} release from GitHub...");
+            string url = null, sha = "";
+            try
+            {
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+                using (var http = new HttpClient())
+                {
+                    http.DefaultRequestHeaders.UserAgent.ParseAdd("firestick-cleanup/" + Version);
+                    string json = await http.GetStringAsync("https://api.github.com/repos/" + app.Source.Substring(7) + "/releases/latest");
+                    var urls = Regex.Matches(json, @"""browser_download_url"":\s*""([^""]+\.apk)""").Cast<Match>().Select(m => m.Groups[1].Value).ToList();
+                    if (urls.Count > 0)
+                    {
+                        url = urls[0];
+                        if (urls.Count == 1)
+                        {
+                            var d = Regex.Match(json, @"""digest"":\s*""sha256:([0-9a-f]+)""");
+                            if (d.Success) sha = d.Groups[1].Value;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Log("  [--] Could not query GitHub (" + ex.Message + ")."); }
+            if (url == null)
+            {
+                if (app.FallbackUrl.Length == 0) { Log("  [!!] Could not query GitHub releases for " + app.Name); return null; }
+                Log("  [--] Using known-good fallback URL.");
+                url = app.FallbackUrl;
+            }
+
+            Directory.CreateDirectory(downloadDir);
+            string apk = Path.Combine(downloadDir, Path.GetFileName(new Uri(url).AbsolutePath));
+            if (File.Exists(apk) && sha.Length > 0 && Sha256(apk) == sha)
+            {
+                Log("  [OK] Already downloaded and verified: " + Path.GetFileName(apk));
+                return apk;
+            }
+            Log("  [..] Downloading " + Path.GetFileName(apk));
+            try
+            {
+                using (var http = new HttpClient())
+                using (var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead))
+                {
+                    resp.EnsureSuccessStatusCode();
+                    using (var src = await resp.Content.ReadAsStreamAsync())
+                    using (var dst = File.Create(apk))
+                        await src.CopyToAsync(dst);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("  [!!] Download failed: " + ex.Message);
+                try { File.Delete(apk); } catch { }
+                return null;
+            }
+            long size = new FileInfo(apk).Length;
+            if (size < 100000) { Log("  [!!] Downloaded file is too small to be an APK."); File.Delete(apk); return null; }
+            if (sha.Length > 0)
+            {
+                if (Sha256(apk) != sha) { Log("  [!!] SHA-256 mismatch; discarding download."); File.Delete(apk); return null; }
+                Log($"  [OK] Downloaded ({HumanSize(size)}), SHA-256 verified");
+            }
+            else Log($"  [OK] Downloaded ({HumanSize(size)})");
+            return apk;
+        }
+
+        private async Task<bool> InstallApkAsync(AppDef app, string apk)
+        {
+            if (await IsInstalledAsync(app.Package)) Log($"  [..] {app.Name} is already installed; updating in place.");
+            Log("  [..] Pushing APK to device...");
+            var (_, push) = await RunAdb("-s", target, "push", apk, DeviceTmp + "/fsc_install.apk");
+            if (!push.Contains("pushed")) { Log("  [!!] Failed to push APK: " + push); return false; }
+            Log("  [..] Installing...");
+            var inst = await DshAsync("pm", "install", "-r", DeviceTmp + "/fsc_install.apk");
+            await DshAsync("rm", "-f", DeviceTmp + "/fsc_install.apk");
+            if (!inst.Contains("Success")) { Log("  [!!] Install failed: " + inst); return false; }
+            if (!await IsInstalledAsync(app.Package)) { Log($"  [!!] Install reported success but {app.Package} is not on the device."); return false; }
+            Log($"  [OK] {app.Name} installed");
+            state.AddUnique("installed", app.Package);
+            return true;
+        }
+
+        private async Task<bool> ConfigureAppAsync(AppDef app)
+        {
+            foreach (var perm in app.Grants)
+            {
+                await DshAsync("pm", "grant", app.Package, perm);
+                Log("  [OK] Granted " + perm.Substring(perm.LastIndexOf('.') + 1));
+            }
+            if (app.Accessibility.Length > 0)
+            {
+                await EnableSecureListAsync("enabled_accessibility_services", app.Accessibility, app.Package);
+                await DshAsync("settings", "put", "secure", "accessibility_enabled", "1");
+                if ((await DshAsync("settings", "get", "secure", "enabled_accessibility_services")).Contains(app.Package))
+                    Log("  [OK] Accessibility service enabled");
+                else { Log("  [!!] Could not enable the accessibility service for " + app.Package); return false; }
+            }
+            if (app.NotificationListener.Length > 0)
+            {
+                await EnableSecureListAsync("enabled_notification_listeners", app.NotificationListener, app.Package);
+                Log("  [OK] Notification listener enabled");
+            }
+            if (app.IsLauncher)
+            {
+                await DshAsync("appops", "set", app.Package, "SYSTEM_ALERT_WINDOW", "allow");
+                Log("  [OK] Overlay permission granted");
+                await DshAsync("cmd", "role", "add-role-holder", "android.app.role.HOME", app.Package);
+                Log("  [OK] HOME role assigned");
+                await DshAsync("cmd", "package", "set-home-activity", "--user", "0", app.Activity);
+                Log("  [OK] Default home activity set");
+            }
+            var launch = await DshAsync("am", "start", "-n", app.Activity);
+            if (launch.Contains("Error"))
+            {
+                var monkey = await DshAsync("monkey", "-p", app.Package, "-c", "android.intent.category.LEANBACK_LAUNCHER", "1");
+                Log(monkey.Contains("Events injected") ? $"  [OK] {app.Name} launched" : $"  [--] Could not launch {app.Name} automatically; open it from the Fire TV app list.");
+            }
+            else Log($"  [OK] {app.Name} launched");
+            return true;
+        }
+
+        private async Task<bool> SetupAppAsync(AppDef app)
+        {
+            Log("");
+            Log("=== Installing " + app.Name + " ===");
+            string apk = await FetchApkAsync(app);
+            if (apk == null) return false;
+            if (!await InstallApkAsync(app, apk)) return false;
+            if (!await ConfigureAppAsync(app)) return false;
+            if (app.Notes.Count > 0)
+                ShowMessage("On your Fire TV (" + app.Name + "):\n\n" + string.Join("\n", app.Notes) + "\n\nClick OK here once done.", "Action required");
+            return true;
+        }
+
+        private async Task VerifyAppAsync(AppDef app)
+        {
+            Log(await IsInstalledAsync(app.Package) ? $"  [OK] {app.Name} is installed" : $"  [!!] {app.Name} is NOT installed");
+            if (app.Accessibility.Length > 0)
+            {
+                bool on = (await DshAsync("settings", "get", "secure", "enabled_accessibility_services")).Contains(app.Package);
+                Log(on ? $"  [OK] {app.Name} accessibility service is active" : $"  [!!] {app.Name} accessibility service is NOT active");
+            }
+            if (app.IsLauncher)
+            {
+                bool role = (await DshAsync("cmd", "role", "get-role-holders", "android.app.role.HOME")).Contains(app.Package);
+                Log(role ? $"  [OK] {app.Name} holds the HOME role" : $"  [--] {app.Name} does not hold the HOME role (expected on some firmware; the Home-button service still works)");
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Package disabling
+        // ------------------------------------------------------------
+        private List<string> BuildBloatList(IEnumerable<string> groupKeys)
+        {
+            var list = new List<string>();
+            var always = groups.FirstOrDefault(g => g.Key == "always");
+            if (always != null) list.AddRange(always.Packages);
+            foreach (var key in groupKeys)
+            {
+                var g = groups.FirstOrDefault(x => x.Key == key);
+                if (g != null) list.AddRange(g.Packages);
+            }
+            return list;
+        }
+
+        private async Task<(List<string> present, List<string> already, List<string> absent)> ClassifyAsync(List<string> bloat)
+        {
+            var all = (await DshAsync("pm", "list", "packages")).Split('\n').Select(l => l.Trim().Replace("package:", "")).ToHashSet();
+            var dis = (await DisabledNowAsync()).ToHashSet();
+            var present = new List<string>(); var already = new List<string>(); var absent = new List<string>();
+            foreach (var p in bloat)
+            {
+                if (dis.Contains(p)) already.Add(p);
+                else if (all.Contains(p)) present.Add(p);
+                else absent.Add(p);
+            }
+            return (present, already, absent);
+        }
+
+        /// <summary>Runs "pm disable-user" for every package in one device-side script. Status: disabled | protected | failed: msg</summary>
+        private async Task<List<KeyValuePair<string, string>>> DisableBatchAsync(List<string> pkgs)
+        {
+            var sb = new StringBuilder();
+            foreach (var p in pkgs) sb.Append("echo \"FSC ").Append(p).Append(" $(pm disable-user --user 0 ").Append(p).Append(" 2>&1)\"\n");
+            var output = await DeviceScriptAsync(sb.ToString());
+            var result = new List<KeyValuePair<string, string>>();
+            foreach (var line in output.Split('\n'))
+            {
+                var m = Regex.Match(line, @"^FSC (\S+) ?(.*)$");
+                if (!m.Success) continue;
+                string msg = m.Groups[2].Value, st;
+                if (msg.Contains("disabled-user")) st = "disabled";
+                else if (msg.Contains("SecurityException") || msg.Contains("rotected")) st = "protected";
+                else st = "failed: " + msg;
+                result.Add(new KeyValuePair<string, string>(m.Groups[1].Value, st));
+            }
+            return result;
+        }
+
+        private async Task<List<KeyValuePair<string, bool>>> EnableBatchAsync(List<string> pkgs)
+        {
+            var sb = new StringBuilder();
+            foreach (var p in pkgs) sb.Append("echo \"FSC ").Append(p).Append(" $(pm enable --user 0 ").Append(p).Append(" 2>&1)\"\n");
+            var output = await DeviceScriptAsync(sb.ToString());
+            var result = new List<KeyValuePair<string, bool>>();
+            foreach (var line in output.Split('\n'))
+            {
+                var m = Regex.Match(line, @"^FSC (\S+) ?(.*)$");
+                if (m.Success) result.Add(new KeyValuePair<string, bool>(m.Groups[1].Value, m.Groups[2].Value.Contains("enabled")));
+            }
+            return result;
+        }
+
+        private async Task<(int disabled, int protectedCount, int passes)> DisablePassesAsync(List<string> remaining)
+        {
+            int total = 0, lastProtected = 0, pass = 0;
+            while (true)
+            {
+                pass++;
+                int pd = 0, pp = 0;
+                var next = new List<string>();
+                Log("");
+                Log($"=== Disabling bloatware (pass {pass}) ===");
+                foreach (var kv in await DisableBatchAsync(remaining))
+                {
+                    if (kv.Value == "disabled") { Log("  [OK] Disabled: " + kv.Key); state.AddUnique("disabled", kv.Key); pd++; }
+                    else if (kv.Value == "protected") { Log("  [--] Protected: " + kv.Key); pp++; next.Add(kv.Key); }
+                    else Log($"  [--] Failed: {kv.Key} ({kv.Value})");
+                }
+                total += pd; lastProtected = pp;
+                Log($"  Pass {pass}: disabled {pd}, protected {pp}");
+                if (pd > 0 && pp > 0 && pass < 3)
+                {
+                    Log("  [..] Some packages are protected; rebooting to retry them...");
+                    if (await RebootAndReconnectAsync()) { remaining = next; continue; }
+                    Log("  [--] Could not reconnect after reboot; continuing with what we have.");
+                }
+                break;
+            }
+            return (total, lastProtected, pass);
+        }
+
+        private async Task<int> ReapplyDisabledAsync()
+        {
+            var now = (await DisabledNowAsync()).ToHashSet();
+            var want = state.GetAll("disabled").Where(p => !now.Contains(p)).ToList();
+            if (want.Count == 0) return 0;
+            return (await DisableBatchAsync(want)).Count(kv => kv.Value == "disabled");
+        }
+
+        // ------------------------------------------------------------
+        // ADB plumbing
+        // ------------------------------------------------------------
+        private Task<string> DshAsync(params string[] args)
+        {
+            var full = new List<string> { "-s", target, "shell" };
+            full.AddRange(args);
+            return RunAdb(full.ToArray()).ContinueWith(t => t.Result.output);
+        }
+
+        /// <summary>Pushes a script to the device and runs it there, avoiding command-length limits.</summary>
+        private async Task<string> DeviceScriptAsync(string script)
+        {
+            string tmp = Path.GetTempFileName();
+            File.WriteAllText(tmp, script.Replace("\r\n", "\n"), new UTF8Encoding(false));
+            await RunAdb("-s", target, "push", tmp, DeviceTmp + "/fsc_script.sh");
+            try { File.Delete(tmp); } catch { }
+            var output = await DshAsync("sh", DeviceTmp + "/fsc_script.sh");
+            await DshAsync("rm", "-f", DeviceTmp + "/fsc_script.sh");
+            return output;
+        }
+
+        private async Task<(int code, string output)> RunAdb(params string[] args)
+        {
+            string argLine = string.Join(" ", args.Select(QuoteArg));
+            try { File.AppendAllText(logFile, "[adb] " + argLine + Environment.NewLine); } catch { }
             return await Task.Run(() =>
             {
                 try
@@ -477,48 +770,57 @@ namespace FirestickCleanup
                     var psi = new ProcessStartInfo
                     {
                         FileName = adbPath,
-                        Arguments = args,
+                        Arguments = argLine,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
                         UseShellExecute = false,
                         CreateNoWindow = true,
-                        StandardOutputEncoding = System.Text.Encoding.UTF8,
-                        StandardErrorEncoding = System.Text.Encoding.UTF8
+                        StandardOutputEncoding = Encoding.UTF8,
+                        StandardErrorEncoding = Encoding.UTF8
                     };
                     using (var p = Process.Start(psi))
                     {
                         var stdout = p.StandardOutput.ReadToEndAsync();
                         var stderr = p.StandardError.ReadToEndAsync();
-                        if (!p.WaitForExit(timeoutMs))
+                        if (!p.WaitForExit(120000))
                         {
                             try { p.Kill(); } catch { }
                             return (-1, "[timeout]");
                         }
                         Task.WaitAll(stdout, stderr);
-                        string combined = (stdout.Result ?? "") + (stderr.Result ?? "");
-                        File.AppendAllText(logFile, combined + Environment.NewLine);
+                        string combined = ((stdout.Result ?? "") + (stderr.Result ?? "")).Replace("\r", "");
+                        try { File.AppendAllText(logFile, combined + Environment.NewLine); } catch { }
                         return (p.ExitCode, combined);
                     }
                 }
-                catch (Exception ex)
-                {
-                    return (-1, ex.Message);
-                }
+                catch (Exception ex) { return (-1, ex.Message); }
             });
         }
 
-        private static int ParseKbToMb(string memInfoLine)
+        private static string QuoteArg(string a)
         {
-            if (string.IsNullOrEmpty(memInfoLine)) return 0;
-            var m = Regex.Match(memInfoLine, @"(\d+)\s*kB");
-            if (!m.Success) return 0;
-            return int.TryParse(m.Groups[1].Value, out var kb) ? kb / 1024 : 0;
+            if (a.Length > 0 && a.IndexOfAny(new[] { ' ', '"', '\t' }) < 0) return a;
+            return "\"" + a.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         }
 
-        private static bool IsValidIP(string s) =>
-            !string.IsNullOrWhiteSpace(s) && IPAddress.TryParse(s, out var ip) &&
-            ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork;
+        private static string Sha256(string path)
+        {
+            using (var sha = SHA256.Create())
+            using (var fs = File.OpenRead(path))
+                return BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "").ToLowerInvariant();
+        }
 
+        private static string HumanSize(long bytes) => bytes >= 1048576 ? (bytes / 1048576) + " MB" : (bytes / 1024) + " KB";
+
+        private static int ParseKbToMb(string memInfoLine)
+        {
+            var m = Regex.Match(memInfoLine ?? "", @"(\d+)\s*kB");
+            return m.Success && long.TryParse(m.Groups[1].Value, out var kb) ? (int)(kb / 1024) : 0;
+        }
+
+        // ------------------------------------------------------------
+        // UI plumbing (safe to call from the background thread)
+        // ------------------------------------------------------------
         private void Log(string text)
         {
             if (txtLog.InvokeRequired) { txtLog.BeginInvoke((Action)(() => Log(text))); return; }
@@ -543,10 +845,8 @@ namespace FirestickCleanup
         private void SetButtons(bool enabled)
         {
             if (btnStart.InvokeRequired) { btnStart.BeginInvoke((Action)(() => SetButtons(enabled))); return; }
-            btnStart.Enabled = enabled;
-            btnRevert.Enabled = enabled;
-            txtDeviceIP.Enabled = enabled;
-            grpOptions.Enabled = enabled;
+            btnStart.Enabled = btnReapply.Enabled = btnStatus.Enabled = btnRevert.Enabled = enabled;
+            txtDeviceIP.Enabled = cmbLauncher.Enabled = chkHomeOnFire.Enabled = grpOptions.Enabled = enabled;
         }
 
         private void ShowMessage(string text, string title)
@@ -555,17 +855,19 @@ namespace FirestickCleanup
             MessageBox.Show(this, text, title, MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
+        private bool Confirm(string text, string title)
+        {
+            if (InvokeRequired) return (bool)Invoke((Func<bool>)(() => Confirm(text, title)));
+            return MessageBox.Show(this, text, title, MessageBoxButtons.OKCancel, MessageBoxIcon.Question) == DialogResult.OK;
+        }
+
         private void ResetLog()
         {
-            if (txtLog.InvokeRequired) { txtLog.Invoke((Action)ResetLog); return; }
             txtLog.Clear();
+            progressBar.Value = 0;
             try
             {
-                File.WriteAllText(logFile,
-                    "============================================" + Environment.NewLine +
-                    "  Firestick Cleanup Log" + Environment.NewLine +
-                    "  Started: " + DateTime.Now + Environment.NewLine +
-                    "============================================" + Environment.NewLine);
+                File.WriteAllText(logFile, "Firestick Cleanup " + Version + " log - " + DateTime.Now + Environment.NewLine);
             }
             catch { }
         }

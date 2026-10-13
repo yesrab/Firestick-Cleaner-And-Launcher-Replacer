@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+DEV="$FAKE_DEV"; sub="$1"; shift
+case "$sub" in
+  list) if [ "${2:-}" = "-d" ]; then sed 's/^/package:/' "$DEV/disabled"; else sed 's/^/package:/' "$DEV/installed"; fi ;;
+  path) grep -qx "$1" "$DEV/installed" && echo "package:/data/app/$1/base.apk" ;;
+  install)
+    src=$(cat "$DEV/last_push_src"); case "$src" in
+      ProjectivyLauncher*) p=com.spocky.projengmenu ;; Couchy*|couchy*) p=com.conreo.couchytv ;;
+      home-on-fire*) p=io.github.toolicious.homeonfire ;; AT4K*|at4k*|base.apk) p=com.overdevs.at4k ;; *) echo "Failure [INSTALL_PARSE_FAILED]"; exit 1 ;; esac
+    grep -qx "$p" "$DEV/installed" || echo "$p" >> "$DEV/installed"; echo "Success" ;;
+  disable-user) p="${@: -1}"
+    if ! grep -qx "$p" "$DEV/installed"; then echo "Error: java.lang.IllegalArgumentException: Unknown package: $p"
+    elif grep -qx "$p" "$DEV/protected"; then echo "Error: java.lang.SecurityException: Cannot disable a protected package: $p"
+    else grep -qx "$p" "$DEV/disabled" || echo "$p" >> "$DEV/disabled"; echo "Package $p new state: disabled-user"; fi ;;
+  enable) p="${@: -1}"; grep -vx "$p" "$DEV/disabled" > "$DEV/disabled.tmp"; mv "$DEV/disabled.tmp" "$DEV/disabled"; echo "Package $p new state: enabled" ;;
+  uninstall) p="${@: -1}"; grep -vx "$p" "$DEV/installed" > "$DEV/installed.tmp"; mv "$DEV/installed.tmp" "$DEV/installed"; echo "Success" ;;
+  grant) ;;
+  *) echo "pm: unknown $sub" ;;
+esac

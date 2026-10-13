@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in -*) ;; *) /bin/rm -f "$FAKE_DEV/fs$a" ;; esac; done

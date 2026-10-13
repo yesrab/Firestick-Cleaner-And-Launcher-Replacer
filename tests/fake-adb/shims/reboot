@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+DEV="$FAKE_DEV"; r=$(cat "$DEV/reboots" 2>/dev/null || echo 0); echo $((r+1)) > "$DEV/reboots"
+# Simulate Amazon re-enabling the first disabled package on each boot
+first=$(head -1 "$DEV/disabled"); [ -n "$first" ] && { tail -n +2 "$DEV/disabled" > "$DEV/disabled.tmp"; mv "$DEV/disabled.tmp" "$DEV/disabled"; echo "$first" >> "$DEV/reenabled_by_boot"; }

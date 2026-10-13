@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+DEV="$FAKE_DEV"; op="$1"; ns="$2"; key="$3"; val="${4:-}"
+case "$op" in
+  get) v=$(sed -n "s/^$key=//p" "$DEV/settings"); echo "${v:-null}" ;;
+  put) grep -v "^$key=" "$DEV/settings" > "$DEV/settings.tmp"; mv "$DEV/settings.tmp" "$DEV/settings"; echo "$key=$val" >> "$DEV/settings" ;;
+  delete) grep -v "^$key=" "$DEV/settings" > "$DEV/settings.tmp"; mv "$DEV/settings.tmp" "$DEV/settings"; echo "Deleted 1 rows" ;;
+esac

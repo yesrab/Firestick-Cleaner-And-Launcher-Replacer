@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+DEV="$FAKE_DEV"
+case "$1 $2" in
+  "role add-role-holder") echo "$4" > "$DEV/role" ;;
+  "role remove-role-holder") [ "$(cat "$DEV/role")" = "$4" ] && : > "$DEV/role" ;;
+  "role get-role-holders") cat "$DEV/role" ;;
+  "package set-home-activity") echo "Success" ;;
+  *) echo "cmd: unknown $*" ;;
+esac
