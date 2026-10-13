@@ -36,12 +36,17 @@ ADDONS_WITHOUT=""       # comma-separated add-on keys forced off (--without, --n
 CHOSEN_ADDONS=""
 DISABLE_GROUPS=""       # comma-separated group keys for non-interactive runs
 NONINTERACTIVE=0
+PROCESS_LIMIT=""        # background process limit: 0-4 | standard ("" = ask; 2 with -y)
+FORCE_GPU=""            # force GPU rendering: on | off ("" = ask; on with -y)
 ADB=""
 TARGET=""
 STATE_FILE=""
 LOGFILE=""
 DEV_SDK=0; DEV_ABIS=""; DEV_RELEASE=""; DEV_FIREOS=""; DEV_MODEL=""
 EXPECTED_VCODE=""
+APK_SPLITS=()            # split APKs to install with base APK_FILE (set when an .apkm bundle is unpacked)
+FOUND_DOWNLOAD=""        # set by wait_for_download
+WATCH_GLOBS=""           # apk_glob patterns of the app being watched for
 if [ -t 1 ]; then CURL_PROGRESS="--progress-bar"; else CURL_PROGRESS="-sS"; fi
 
 # ------------------------------------------------------------
@@ -63,11 +68,16 @@ Modes (default: full install)
 
 Options
   --ip <ip[:port]>    Fire TV address (skips the prompt)
-  --launcher <key>    projectivy | at4k | couchy   (default: projectivy)
+  --launcher <key>    projectivy | at4k | couchy | stock   (default: projectivy; stock keeps
+                      the Amazon home screen and only debloats)
   --with <a,b,..>     Add-ons: homeonfire, youtubetv, googleapp, smarttube (see launchers.conf)
   --without <a,b,..>  Add-ons to skip
   --home-on-fire      Same as --with homeonfire      --no-home-on-fire: --without homeonfire
   --disable <a,b,..>  Optional groups to disable, comma-separated (see packages.conf)
+  --process-limit <n> Background process limit (Android developer option): 0-4, default 2,
+                      or "standard" to leave Fire OS's own limit
+  --gpu-rendering <on|off>
+                      Force GPU rendering for every app (Android developer option), default on
   -y, --non-interactive
                       Never prompt; requires --ip. Uses --launcher/--with/--disable,
                       or the saved choices for --reapply.
@@ -100,6 +110,10 @@ while [ $# -gt 0 ]; do
         --no-home-on-fire) ADDONS_WITHOUT="${ADDONS_WITHOUT:+$ADDONS_WITHOUT,}homeonfire" ;;
         --disable)  DISABLE_GROUPS="${2:-}"; shift ;;
         --disable=*) DISABLE_GROUPS="${1#--disable=}" ;;
+        --process-limit)   PROCESS_LIMIT="${2:-}"; shift ;;
+        --process-limit=*) PROCESS_LIMIT="${1#--process-limit=}" ;;
+        --gpu-rendering)   FORCE_GPU="${2:-}"; shift ;;
+        --gpu-rendering=*) FORCE_GPU="${1#--gpu-rendering=}" ;;
         -y|--non-interactive) NONINTERACTIVE=1 ;;
         -h|--help)  usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -117,6 +131,10 @@ ok()     { say "  [OK] $*"; }
 info()   { say "  [..] $*"; }
 warn()   { say "  [--] $*"; }
 err()    { say "  [!!] $*"; }
+# qgrep: "grep -q" that reads all of its input. With "producer | grep -q", grep exits on the
+# first match, the producer then dies of SIGPIPE on its next write and, under pipefail, the
+# whole test fails at random (seen with "pm path" of a 26-split app). Same exit status as -q.
+qgrep()  { grep "$@" >/dev/null; }
 banner() {
     say ""
     say "  ========================================"
@@ -303,7 +321,7 @@ wait_for_device() {
         state="$(device_state)"
         case "$state" in
             device)
-                if adbt shell echo fsc_ok 2>/dev/null | grep -q fsc_ok; then
+                if adbt shell echo fsc_ok 2>/dev/null | qgrep fsc_ok; then
                     return 0
                 fi ;;
             unauthorized)
@@ -424,6 +442,148 @@ restore_secure_setting() {
 }
 
 # ------------------------------------------------------------
+# Performance tweaks (two of Android's developer options)
+# ------------------------------------------------------------
+# Background process limit: how many apps Android keeps alive in the background after you
+# leave them. Fire OS 8 (Android 10+) reads it from device_config; Fire OS 6/7 (Android 8/9)
+# from the activity_manager_constants global setting. Both survive a reboot. Android's own
+# developer-options toggle does not persist, which is why the tool sets the underlying value.
+# Force GPU rendering: the persist.sys.ui.hw property, read by every new window.
+
+describe_limit() {
+    if [ "$1" = standard ]; then echo "Fire OS standard"; else echo "at most $1 apps kept in the background"; fi
+}
+
+# Prints the current limit: a number, or "standard" when Fire OS's own default applies.
+get_process_limit() {
+    local v=""
+    if [ "$DEV_SDK" -ge 29 ]; then
+        v="$(dsh device_config get activity_manager max_cached_processes)"
+    elif [ "$DEV_SDK" -ge 26 ]; then
+        v="$(dsh settings get global activity_manager_constants | tr ',' '\n' | sed -n 's/^max_cached_processes=//p' | head -1)"
+    fi
+    case "$v" in ''|null|*[!0-9]*) echo standard ;; *) echo "$v" ;; esac
+}
+
+# set_process_limit <number|standard> -> 0 when the device reads the new value back
+set_process_limit() {
+    local n="$1" cur new
+    if [ "$DEV_SDK" -ge 29 ]; then
+        if [ "$n" = standard ]; then
+            dsh device_config delete activity_manager max_cached_processes >/dev/null
+        else
+            dsh device_config put activity_manager max_cached_processes "$n" >/dev/null
+        fi
+    elif [ "$DEV_SDK" -ge 26 ]; then
+        # The setting is a "key=value,key=value" list; keep whatever else is in it.
+        cur="$(dsh settings get global activity_manager_constants)"
+        [ "$cur" = null ] && cur=""
+        new="$(printf '%s' "$cur" | tr ',' '\n' | grep -v '^max_cached_processes=' | grep -v '^$' | tr '\n' ',' | sed 's/,$//')"
+        [ "$n" = standard ] || new="${new:+$new,}max_cached_processes=$n"
+        if [ -n "$new" ]; then
+            dsh settings put global activity_manager_constants "$new" >/dev/null
+        else
+            dsh settings delete global activity_manager_constants >/dev/null
+        fi
+    else
+        warn "The background process limit needs Fire OS 6 or newer (Android 8); skipped."
+        return 1
+    fi
+    [ "$(get_process_limit)" = "$n" ]
+}
+
+get_force_gpu() {
+    if [ "$(dsh getprop persist.sys.ui.hw)" = true ]; then echo on; else echo off; fi
+}
+
+# set_force_gpu <on|off> -> 0 when the property reads the new value back
+set_force_gpu() {
+    local v=false
+    [ "$1" = on ] && v=true
+    dsh setprop persist.sys.ui.hw "$v" >/dev/null
+    [ "$(dsh getprop persist.sys.ui.hw)" = "$v" ]
+}
+
+# Normalises PROCESS_LIMIT and FORCE_GPU from the command line; dies on nonsense.
+validate_performance() {
+    case "$PROCESS_LIMIT" in
+        ""|standard|[0-4]) ;;
+        s|S) PROCESS_LIMIT=standard ;;
+        *) die "--process-limit must be 0, 1, 2, 3, 4 or standard (got '$PROCESS_LIMIT')" ;;
+    esac
+    case "$FORCE_GPU" in
+        ""|on|off) ;;
+        yes|y|Y|true|1) FORCE_GPU=on ;;
+        no|n|N|false|0) FORCE_GPU=off ;;
+        *) die "--gpu-rendering must be on or off (got '$FORCE_GPU')" ;;
+    esac
+}
+
+# apply_performance [banner]: applies PROCESS_LIMIT and FORCE_GPU, recording the previous
+# values in the state file the first time so --revert can put them back.
+apply_performance() {
+    local title="${1:-STEP 5: Performance tweaks}" cur
+    banner "$title"
+    if [ -n "$PROCESS_LIMIT" ]; then
+        cur="$(get_process_limit)"
+        state_has prev_process_limit || state_put prev_process_limit "$cur"
+        if set_process_limit "$PROCESS_LIMIT"; then
+            state_set process_limit "$PROCESS_LIMIT"
+            ok "Background process limit: $(describe_limit "$PROCESS_LIMIT") (was $(describe_limit "$cur"))"
+        else
+            warn "Could not set the background process limit on this firmware."
+        fi
+    fi
+    if [ -n "$FORCE_GPU" ]; then
+        cur="$(get_force_gpu)"
+        state_has prev_force_gpu || state_put prev_force_gpu "$(dsh getprop persist.sys.ui.hw)"
+        if set_force_gpu "$FORCE_GPU"; then
+            state_set force_gpu "$FORCE_GPU"
+            ok "Force GPU rendering: $FORCE_GPU (was $cur)"
+        else
+            warn "Force GPU rendering cannot be changed over adb on this firmware (persist.sys.ui.hw is protected)."
+        fi
+    fi
+}
+
+# Checks the device still has the values recorded in the state file (after reboots and updates).
+verify_performance() {
+    local want cur
+    want="$(state_get process_limit)"
+    if [ -n "$want" ]; then
+        cur="$(get_process_limit)"
+        if [ "$cur" = "$want" ]; then ok "Background process limit is $(describe_limit "$cur")"
+        else warn "Background process limit is $(describe_limit "$cur"), expected $(describe_limit "$want")"; fi
+    fi
+    want="$(state_get force_gpu)"
+    if [ -n "$want" ]; then
+        cur="$(get_force_gpu)"
+        if [ "$cur" = "$want" ]; then ok "Force GPU rendering is $cur"; else warn "Force GPU rendering is $cur, expected $want"; fi
+    fi
+}
+
+# Puts both settings back to what they were before the tool touched them (stock when unknown).
+restore_performance() {
+    local prev
+    if [ -f "$STATE_FILE" ]; then
+        if state_has prev_process_limit; then
+            prev="$(state_get prev_process_limit)"
+            [ -n "$prev" ] || prev=standard
+            set_process_limit "$prev" && ok "Background process limit restored: $(describe_limit "$prev")"
+        fi
+        if state_has prev_force_gpu; then
+            prev="$(state_get prev_force_gpu)"
+            if [ "$prev" = true ]; then set_force_gpu on; else set_force_gpu off; fi
+            ok "Force GPU rendering restored"
+        fi
+    else
+        set_process_limit standard
+        set_force_gpu off
+        ok "Background process limit and GPU rendering set back to stock"
+    fi
+}
+
+# ------------------------------------------------------------
 # APK download / install / configure (driven by launchers.conf)
 # ------------------------------------------------------------
 human_size() {
@@ -472,6 +632,78 @@ verify_apk() {
     ok "Signing certificate matches APKMirror's record for this app"
 }
 
+# prepare_apk <file> <package> [expected signing-cert sha256]
+# Makes a downloaded or user-supplied file installable and sets APK_FILE and APK_SPLITS.
+# A plain APK is verified as is. An .apkm bundle (APKMirror's split-APK download) is unpacked
+# under downloads/: base.apk plus the split APKs that fit this device's CPU are kept, the
+# bundle's info.json is checked against the package, and base.apk is verified.
+prepare_apk() {
+    local f="$1" pkg="$2" want="${3:-}" dir e abi abis pname vcode has_base=0 abi_seen=0 abi_kept=0
+    local -a keep
+    keep=()
+    APK_SPLITS=()
+    case "$f" in
+        *.apkm|*.APKM) ;;
+        *) APK_FILE="$f"; verify_apk "$f" "$want"; return ;;
+    esac
+    if [ "$(head -c 2 "$f" 2>/dev/null)" != "PK" ]; then
+        err "$(basename "$f") is not an APK bundle (not a zip file)."
+        return 1
+    fi
+    command -v unzip >/dev/null 2>&1 || { err "unzip is needed to open the $(basename "$f") bundle."; return 1; }
+    info "$(basename "$f") is an APK bundle (base APK + split APKs); unpacking it..."
+    abis=" $(printf '%s' "$DEV_ABIS" | tr ',-' ' _') "
+    while IFS= read -r e; do
+        case "$e" in
+            base.apk) has_base=1; keep+=("$e") ;;
+            info.json) keep+=("$e") ;;
+            split_config.armeabi_v7a.apk|split_config.arm64_v8a.apk|split_config.armeabi.apk|split_config.x86.apk|split_config.x86_64.apk|split_config.mips.apk|split_config.mips64.apk)
+                abi_seen=1
+                abi="${e#split_config.}"; abi="${abi%.apk}"
+                if [ -z "$DEV_ABIS" ]; then abi_kept=1; keep+=("$e")
+                else case "$abis" in *" $abi "*) abi_kept=1; keep+=("$e") ;; esac
+                fi ;;
+            */*) ;;
+            *.apk) keep+=("$e") ;;   # density, language and feature splits
+        esac
+    done <<EOF
+$(unzip -Z1 "$f" 2>/dev/null)
+EOF
+    if [ "$has_base" -eq 0 ]; then
+        err "$(basename "$f") has no base.apk inside; it is not an APK bundle."
+        return 1
+    fi
+    if [ "$abi_seen" -eq 1 ] && [ "$abi_kept" -eq 0 ]; then
+        err "The bundle has no native code for this Fire TV's CPU (${DEV_ABIS:-unknown}). Download the variant the tool opened."
+        return 1
+    fi
+    mkdir -p "$DOWNLOAD_DIR"
+    dir="$DOWNLOAD_DIR/$(basename "${f%.*}").d"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    if ! unzip -q -o "$f" "${keep[@]}" -d "$dir" 2>/dev/null; then
+        err "Could not unpack $(basename "$f")."
+        rm -rf "$dir"
+        return 1
+    fi
+    if [ -f "$dir/info.json" ]; then
+        pname="$(sed -n 's/.*"pname": *"\([^"]*\)".*/\1/p' "$dir/info.json" | head -1)"
+        vcode="$(sed -n 's/.*"versioncode": *"\([^"]*\)".*/\1/p' "$dir/info.json" | head -1)"
+        if [ -n "$pname" ] && [ -n "$pkg" ] && [ "$pname" != "$pkg" ]; then
+            err "$(basename "$f") is a bundle of $pname, not $pkg."
+            rm -rf "$dir"
+            return 1
+        fi
+        [ -n "$EXPECTED_VCODE" ] || EXPECTED_VCODE="$vcode"
+    fi
+    APK_FILE="$dir/base.apk"
+    for e in "${keep[@]}"; do
+        case "$e" in base.apk|info.json) ;; *) APK_SPLITS+=("$dir/$e") ;; esac
+    done
+    ok "Unpacked: base.apk + ${#APK_SPLITS[@]} split APK(s) for ${DEV_ABIS:-this device}"
+    verify_apk "$APK_FILE" "$want"
+}
+
 open_url() {
     if [ -n "${FSC_BROWSER:-}" ]; then
         "$FSC_BROWSER" "$1" >/dev/null 2>&1 &
@@ -483,22 +715,154 @@ open_url() {
     esac
 }
 
-# wait_for_download <package> <marker-file> <timeout-s>
-# Prints the path of a new, complete <package>_*.apk in the watched folders.
+# apkm_info <bundle> <key> -> value of "key" in the bundle's info.json (APKMirror .apkm), or empty
+apkm_info() {
+    unzip -p "$1" info.json 2>/dev/null | sed -n "s/.*\"$2\": *\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+# download_matches <package> <file> -> 0 when the file is for this package: its name starts
+# with <package>_ (what APKMirror names it), or it is an .apkm bundle whose info.json says so.
+download_matches() {
+    local pkg="$1" f="$2"
+    case "$(basename "$f")" in "${pkg}_"*) return 0 ;; esac
+    case "$f" in *.apkm|*.APKM) [ "$(apkm_info "$f" pname)" = "$pkg" ] ;; *) return 1 ;; esac
+}
+
+# download_is_build <file> <version-code> -> 0 when the file is that build (by name or info.json)
+download_is_build() {
+    local f="$1" vcode="$2"
+    [ -n "$vcode" ] || return 1
+    case "$(basename "$f")" in *"-${vcode}_"*|*"-${vcode}.apk"|*"-${vcode}.apkm") return 0 ;; esac
+    case "$f" in *.apkm|*.APKM) [ "$(apkm_info "$f" versioncode)" = "$vcode" ] ;; *) return 1 ;; esac
+}
+
+# download_complete <file> -> 0 when the file looks like a finished download
+download_complete() {
+    [ -f "$1" ] && [ "$(filesize "$1")" -gt 100000 ] && [ ! -e "$1.crdownload" ] && [ ! -e "$1.part" ]
+}
+
+# matches_watch_glob <file> -> 0 when the name matches one of WATCH_GLOBS (or its .apkm form)
+matches_watch_glob() {
+    local g b
+    b="$(basename "$1")"
+    for g in $WATCH_GLOBS; do
+        # shellcheck disable=SC2254  # the patterns are meant to be globs
+        case "$b" in $g|${g}m) return 0 ;; esac
+    done
+    return 1
+}
+
+# list_downloads <package> -> every file in the watched folders that could be this app's APK
+# or .apkm bundle, one per line. WATCH_GLOBS holds the app's apk_glob patterns from
+# launchers.conf; those are honoured next to the entry point like a user-supplied APK.
+list_downloads() {
+    local pkg="$1" f g
+    for f in "$DOWNLOADS_WATCH"/*.apk "$DOWNLOADS_WATCH"/*.apkm "$PLATFORM_DIR"/*.apk "$PLATFORM_DIR"/*.apkm; do
+        [ -f "$f" ] && download_matches "$pkg" "$f" && printf '%s\n' "$f"
+    done
+    for g in $WATCH_GLOBS; do
+        for f in "$PLATFORM_DIR"/$g "$PLATFORM_DIR"/${g}m; do
+            [ -f "$f" ] && printf '%s\n' "$f"
+        done
+    done
+}
+
+# pick_download <package> <version-code> <marker-file>
+# Prints the best complete download: the newest file of the build APKMirror reported (of any
+# age, so a file saved before the run started counts), else the newest file saved since the
+# watch began.
+pick_download() {
+    local pkg="$1" vcode="$2" marker="$3" pass f best=""
+    for pass in build new; do
+        [ "$pass" = build ] && [ -z "$vcode" ] && continue
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            download_complete "$f" || continue
+            case "$pass" in
+                build) download_is_build "$f" "$vcode" || continue ;;
+                new)   [ "$f" -nt "$marker" ] || continue ;;
+            esac
+            if [ -z "$best" ] || [ "$f" -nt "$best" ]; then best="$f"; fi
+        done <<EOF
+$(list_downloads "$pkg")
+EOF
+        if [ -n "$best" ]; then printf '%s\n' "$best"; return 0; fi
+    done
+    return 1
+}
+
+# explain_watch <package> <version-code> <marker-file>
+# Lists what the watcher can see in the watched folders and why each file was not taken.
+explain_watch() {
+    local pkg="$1" vcode="$2" marker="$3" dir f n=0 shown why
+    say ""
+    say "  Looking for ${pkg}_*.apk or ${pkg}_*.apkm${vcode:+ (build $vcode)}, or an .apkm bundle"
+    say "  whose info.json names $pkg, in:"
+    say "    $DOWNLOADS_WATCH"
+    say "    $PLATFORM_DIR${WATCH_GLOBS:+  (here also: $WATCH_GLOBS)}"
+    for dir in "$DOWNLOADS_WATCH" "$PLATFORM_DIR"; do
+        shown=0
+        for f in "$dir"/*.apk "$dir"/*.apkm "$dir"/*.crdownload "$dir"/*.part "$dir"/*.download; do
+            [ -e "$f" ] || continue
+            n=$((n + 1)); shown=$((shown + 1))
+            if [ "$shown" -gt 8 ]; then say "    ... and more in $dir"; break; fi
+            case "$f" in
+                *.crdownload|*.part|*.download) why="still downloading" ;;
+                *)
+                    if ! download_matches "$pkg" "$f" && ! { [ "$dir" = "$PLATFORM_DIR" ] && matches_watch_glob "$f"; }; then
+                        case "$f" in
+                            *.apkm|*.APKM) why="a bundle of another app ($(apkm_info "$f" pname))" ;;
+                            *) why="name does not start with ${pkg}_" ;;
+                        esac
+                    elif ! download_complete "$f"; then
+                        why="still downloading, or too small to be an APK ($(human_size "$(filesize "$f")"))"
+                    elif [ -n "$vcode" ] && ! download_is_build "$f" "$vcode" && [ ! "$f" -nt "$marker" ]; then
+                        why="not build $vcode and older than this run; download it again or save it again"
+                    else
+                        why="accepted; waiting for its size to stop changing"
+                    fi ;;
+            esac
+            say "    $(basename "$f")  [$why]"
+        done
+    done
+    if [ "$n" -eq 0 ]; then
+        say "    (no .apk or .apkm files in either folder)"
+        say "  If your browser saves downloads elsewhere, copy the file into $PLATFORM_DIR,"
+        say "  or run again with FSC_DOWNLOADS_DIR=<that folder>."
+    elif [ -n "$WATCH_GLOBS" ]; then
+        say "  A file with another name is also accepted when it is in $PLATFORM_DIR"
+        say "  and named like one of: $WATCH_GLOBS (or the same with .apkm)."
+    fi
+    say ""
+}
+
+# wait_for_download <package> <version-code> <marker-file> <timeout-s>
+# Waits for a complete APK or .apkm bundle for <package> in the watched folders and puts its
+# path in FOUND_DOWNLOAD. On a terminal, pressing Enter checks again at once and lists what
+# the watcher sees. Call it directly (not in $(...)) so its messages reach the screen.
 wait_for_download() {
-    local pkg="$1" marker="$2" timeout="$3" waited=0 f size1 size2
+    local pkg="$1" vcode="$2" marker="$3" timeout="$4" waited=0 f size1 size2 rc
+    FOUND_DOWNLOAD=""
     while [ "$waited" -lt "$timeout" ]; do
-        f="$(find "$DOWNLOADS_WATCH" "$PLATFORM_DIR" -maxdepth 1 -name "${pkg}_*.apk" -newer "$marker" 2>/dev/null | head -1)"
-        if [ -n "$f" ]; then
+        if f="$(pick_download "$pkg" "$vcode" "$marker")"; then
             size1="$(filesize "$f")"
             sleep 2
             size2="$(filesize "$f")"
-            if [ "$size1" = "$size2" ] && [ "$size1" -gt 100000 ] && [ ! -e "$f.crdownload" ] && [ ! -e "$f.part" ]; then
-                printf '%s\n' "$f"
+            if [ "$size1" = "$size2" ]; then
+                FOUND_DOWNLOAD="$f"
                 return 0
             fi
+            waited=$((waited + 2))
+            continue
         fi
-        sleep 2
+        if [ -t 0 ]; then
+            # Enter: look again right away and say what was found and why it was skipped.
+            read -r -t 4 _ 2>/dev/null; rc=$?
+            if [ "$rc" -eq 0 ]; then explain_watch "$pkg" "$vcode" "$marker"; continue; fi
+            [ "$rc" -gt 128 ] || sleep 4   # rc 1 = stdin closed: do not spin
+        else
+            sleep 4
+        fi
         waited=$((waited + 4))
     done
     return 1
@@ -516,7 +880,7 @@ apkmirror_api_json() {
 apkmirror_lookup() {
     local pkg="$1" json apks best
     json="$(apkmirror_api_json "$pkg" 2>/dev/null | sed 's#\\/#/#g')" || return 1
-    printf '%s' "$json" | grep -q '"exists":true' || return 1
+    printf '%s' "$json" | qgrep '"exists":true' || return 1
     AM_VERSION="$(printf '%s' "$json" | sed -n 's/.*"release":{"version":"\([^"]*\)".*/\1/p')"
     apks="$(printf '%s' "$json" | sed -n 's/.*"apks":\[\(.*\)\]}\]}[[:space:]]*$/\1/p' | awk '{ gsub(/\},\{/, "}\n{"); print }')"
     best="$(printf '%s\n' "$apks" | awk -v sdk="$DEV_SDK" -v abis="$DEV_ABIS" '
@@ -553,21 +917,23 @@ apkmirror_lookup() {
     [ -n "$AM_VCODE" ] && [ -n "$AM_PAGE" ]
 }
 
-# apkmirror_fetch <section> <package> -> sets APK_FILE (and EXPECTED_VCODE)
+# apkmirror_fetch <section> <package> -> sets APK_FILE and APK_SPLITS (and EXPECTED_VCODE)
 apkmirror_fetch() {
-    local sec="$1" pkg="$2" name page marker found f
+    local sec="$1" pkg="$2" name page marker found f rc
     name="$(lconf "$sec" name)"
+    WATCH_GLOBS="$(lconf "$sec" apk_glob)"
     info "Looking up $name on APKMirror for Android API $DEV_SDK (${DEV_ABIS:-unknown CPU})..."
     if apkmirror_lookup "$pkg"; then
         ok "Latest: $name $AM_VERSION (build $AM_VCODE, min API $AM_MINAPI, $AM_ARCHES)"
         page="$AM_PAGE"
         mkdir -p "$DOWNLOAD_DIR"
-        for f in "$DOWNLOAD_DIR/${pkg}_"*"-${AM_VCODE}_"*.apk "$DOWNLOAD_DIR/${pkg}_"*"-${AM_VCODE}.apk"; do
+        for f in "$DOWNLOAD_DIR/${pkg}_"*"-${AM_VCODE}_"*.apk "$DOWNLOAD_DIR/${pkg}_"*"-${AM_VCODE}.apk" \
+                 "$DOWNLOAD_DIR/${pkg}_"*"-${AM_VCODE}_"*.apkm "$DOWNLOAD_DIR/${pkg}_"*"-${AM_VCODE}.apkm"; do
             if [ -f "$f" ]; then
-                APK_FILE="$f"
                 EXPECTED_VCODE="$AM_VCODE"
                 ok "Already downloaded: $(basename "$f")"
-                return 0
+                prepare_apk "$f" "$pkg" "$AM_SHA256"
+                return
             fi
         done
     else
@@ -577,28 +943,37 @@ apkmirror_fetch() {
         [ -n "$page" ] || { err "No APKMirror page configured for $name."; return 1; }
     fi
     if [ "$NONINTERACTIVE" -eq 1 ]; then
-        err "APKMirror does not allow scripted downloads. Save the ${pkg}_*.apk file in $PLATFORM_DIR and run again."
+        err "APKMirror does not allow scripted downloads. Save the ${pkg}_*.apk or .apkm file in $PLATFORM_DIR and run again."
         return 1
     fi
     say ""
     say "  APKMirror does not let scripts download files, so your browser will open on the"
     say "  download page for $name${AM_VERSION:+ $AM_VERSION} that matches this Fire TV."
-    say "  Click 'DOWNLOAD APK' there (and the 'here' link if nothing starts)."
-    say "  Watching $DOWNLOADS_WATCH and $PLATFORM_DIR for the file..."
+    say "  Click 'DOWNLOAD APK' or 'DOWNLOAD APK BUNDLE' there (and the 'here' link if nothing"
+    say "  starts). An .apkm bundle is fine: the tool unpacks it. Keep the file name as it is."
+    say "  Watching $DOWNLOADS_WATCH"
+    say "  and $PLATFORM_DIR for the file."
+    say "  Press Enter at any time to see what the watcher sees."
     marker="$(mktemp "${TMPDIR:-/tmp}/fsc.XXXXXX")"
     open_url "$page"
-    found="$(wait_for_download "$pkg" "$marker" 900)"
+    wait_for_download "$pkg" "$AM_VCODE" "$marker" 900; rc=$?
     rm -f "$marker"
-    if [ -z "$found" ]; then
-        err "No ${pkg}_*.apk appeared within 15 minutes. Save it in $PLATFORM_DIR and run again."
+    if [ "$rc" -ne 0 ]; then
+        err "No APK or .apkm bundle for $pkg appeared within 15 minutes. Save it in $PLATFORM_DIR and run again."
         return 1
     fi
+    found="$FOUND_DOWNLOAD"
     mkdir -p "$DOWNLOAD_DIR"
-    APK_FILE="$DOWNLOAD_DIR/$(basename "$found")"
-    [ "$found" = "$APK_FILE" ] || mv -f "$found" "$APK_FILE"
-    ok "Got $(basename "$APK_FILE") ($(human_size "$(filesize "$APK_FILE")"))"
-    verify_apk "$APK_FILE" "$AM_SHA256" || return 1
+    f="$DOWNLOAD_DIR/$(basename "$found")"
+    # A file the user renamed is cached under a name later runs recognise.
+    case "$(basename "$found")" in
+        "${pkg}_"*) ;;
+        *) [ -n "$AM_VCODE" ] && f="$DOWNLOAD_DIR/${pkg}_apkmirror-${AM_VCODE}.${found##*.}" ;;
+    esac
+    [ "$found" = "$f" ] || mv -f "$found" "$f"
+    ok "Got $(basename "$f") ($(human_size "$(filesize "$f")"))"
     EXPECTED_VCODE="$AM_VCODE"
+    prepare_apk "$f" "$pkg" "$AM_SHA256"
 }
 
 # gh_latest owner/repo [asset-glob] -> sets GH_URL, GH_SHA (may be empty) and GH_ASSET
@@ -627,7 +1002,7 @@ gh_latest() {
         done <<EOF
 $assets
 EOF
-        printf '%s' "$pattern" | grep -q '{abi}' || break
+        printf '%s' "$pattern" | qgrep '{abi}' || break
     done
     return 1
 }
@@ -638,12 +1013,16 @@ fetch_apk() {
     name="$(lconf "$sec" name)"
     source="$(lconf "$sec" source)"
     EXPECTED_VCODE=""
+    APK_SPLITS=()
+    # A pattern ending in .apk also accepts the .apkm bundle form of the same name.
     for glob in $(lconf "$sec" apk_glob); do
-        for f in "$PLATFORM_DIR"/$glob; do
+        for f in "$PLATFORM_DIR"/$glob "$PLATFORM_DIR"/${glob}m; do
             if [ -f "$f" ]; then
-                APK_FILE="$f"
                 ok "Using local APK: $(basename "$f")"
-                return 0
+                case "$f" in
+                    *.apkm|*.APKM) prepare_apk "$f" "$(lconf "$sec" package)" ""; return ;;
+                    *) APK_FILE="$f"; return 0 ;;
+                esac
             fi
         done
     done
@@ -693,7 +1072,7 @@ fetch_apk() {
         manual:*)
             err "$name has to be downloaded by hand from ${source#manual:}"
             say "       Save the APK in: $PLATFORM_DIR"
-            say "       Accepted file names: $(lconf "$sec" apk_glob)"
+            say "       Accepted file names: $(lconf "$sec" apk_glob) (an .apkm bundle named the same way is fine)"
             return 1 ;;
         *)
             err "Unknown source '$source' for $name in launchers.conf"
@@ -705,24 +1084,35 @@ install_apk() {
     local sec="$1" apk="$2" pkg name out
     pkg="$(lconf "$sec" package)"
     name="$(lconf "$sec" name)"
-    if dsh pm path "$pkg" | grep -q "package:"; then
+    if dsh pm path "$pkg" | qgrep "package:"; then
         info "$name is already installed; updating in place."
     fi
-    info "Pushing APK to device..."
-    out="$(adbt push "$apk" "$DEVICE_TMP/fsc_install.apk" 2>&1)"
-    log "$out"
-    if ! printf '%s' "$out" | grep -q "pushed"; then
-        err "Failed to push APK: $out"
-        return 1
+    if [ "${#APK_SPLITS[@]}" -gt 0 ]; then
+        # Split APKs from an .apkm bundle: adb opens one install session for all parts.
+        info "Installing base APK + ${#APK_SPLITS[@]} split APK(s)..."
+        out="$(adbt install-multiple -r "$apk" "${APK_SPLITS[@]}" 2>&1 | tr -d '\r')"
+        log "[adb install-multiple] $out"
+        if ! printf '%s' "$out" | qgrep "Success"; then
+            err "Install failed: $out"
+            return 1
+        fi
+    else
+        info "Pushing APK to device..."
+        out="$(adbt push "$apk" "$DEVICE_TMP/fsc_install.apk" 2>&1)"
+        log "$out"
+        if ! printf '%s' "$out" | qgrep "pushed"; then
+            err "Failed to push APK: $out"
+            return 1
+        fi
+        info "Installing..."
+        out="$(dsh pm install -r "$DEVICE_TMP/fsc_install.apk")"
+        adbt shell rm -f "$DEVICE_TMP/fsc_install.apk" >/dev/null 2>&1
+        if ! printf '%s' "$out" | qgrep "Success"; then
+            err "Install failed: $out"
+            return 1
+        fi
     fi
-    info "Installing..."
-    out="$(dsh pm install -r "$DEVICE_TMP/fsc_install.apk")"
-    adbt shell rm -f "$DEVICE_TMP/fsc_install.apk" >/dev/null 2>&1
-    if ! printf '%s' "$out" | grep -q "Success"; then
-        err "Install failed: $out"
-        return 1
-    fi
-    if ! dsh pm path "$pkg" | grep -q "package:"; then
+    if ! dsh pm path "$pkg" | qgrep "package:"; then
         err "Install reported success but $pkg is not on the device."
         return 1
     fi
@@ -744,14 +1134,14 @@ launch_app() {
     act="$(lconf "$sec" activity)"
     if [ -n "$act" ]; then
         out="$(dsh am start -n "$act")"
-        if ! printf '%s' "$out" | grep -q "Error"; then
+        if ! printf '%s' "$out" | qgrep "Error"; then
             ok "$(lconf "$sec" name) launched"
             return 0
         fi
     fi
     # No activity configured, or it failed: resolve the app's leanback launcher entry instead.
     out="$(dsh monkey -p "$(lconf "$sec" package)" -c android.intent.category.LEANBACK_LAUNCHER 1)"
-    if printf '%s' "$out" | grep -q "Events injected"; then
+    if printf '%s' "$out" | qgrep "Events injected"; then
         ok "$(lconf "$sec" name) launched"
     else
         warn "Could not launch $(lconf "$sec" name) automatically; open it from the Fire TV app list."
@@ -764,9 +1154,9 @@ disable_replaced_packages() {
     [ -n "$(lconf "$sec" disables)" ] || return 0
     disabled_now="$(dsh pm list packages -d)"
     for p in $(lconf "$sec" disables); do
-        if printf '%s\n' "$disabled_now" | grep -qx "package:$p"; then
+        if printf '%s\n' "$disabled_now" | qgrep -x "package:$p"; then
             info "$p is already disabled"
-        elif dsh pm path "$p" | grep -q "package:"; then
+        elif dsh pm path "$p" | qgrep "package:"; then
             pkgs="$pkgs $p"
         else
             info "$p is not on this device"
@@ -800,7 +1190,7 @@ configure_app() {
     if [ -n "$acc" ]; then
         enable_secure_list enabled_accessibility_services "$acc" "$pkg"
         dsh settings put secure accessibility_enabled 1 >/dev/null
-        if dsh settings get secure enabled_accessibility_services | grep -q "$pkg"; then
+        if dsh settings get secure enabled_accessibility_services | qgrep "$pkg"; then
             ok "Accessibility service enabled"
         else
             err "Could not enable the accessibility service for $pkg"
@@ -837,7 +1227,7 @@ prepare_boot() {
     dsh appops set "$pkg" RUN_IN_BACKGROUND allow >/dev/null
     dsh appops set "$pkg" RUN_ANY_IN_BACKGROUND allow >/dev/null
     dsh am set-standby-bucket "$pkg" active >/dev/null
-    if dsh dumpsys deviceidle whitelist | grep -q "$pkg"; then
+    if dsh dumpsys deviceidle whitelist | qgrep "$pkg"; then
         ok "Allowed to run at boot and in the background"
     else
         info "Could not add $pkg to the doze whitelist (not supported on this firmware)"
@@ -925,8 +1315,22 @@ EOF
 }
 
 # Downloads, installs, configures and launches one app from launchers.conf.
+# A section with source=none (the stock launcher) is kept as it is: nothing is installed,
+# and the HOME role is handed back to it if another launcher holds it.
 setup_app() {
-    local sec="$1"
+    local sec="$1" pkg name
+    if [ "$(lconf "$sec" source)" = none ]; then
+        pkg="$(lconf "$sec" package)"
+        name="$(lconf "$sec" name)"
+        banner "Keeping $name"
+        if [ -n "$pkg" ] && [ "$(home_role_holder)" != "$pkg" ]; then
+            dsh cmd role add-role-holder android.app.role.HOME "$pkg" >/dev/null
+            ok "HOME role handed back to $name"
+            info "Launchers installed by an earlier run stay installed; --revert removes them."
+        fi
+        ok "$name stays as it is; nothing to install"
+        return 0
+    fi
     banner "Installing $(lconf "$sec" name)"
     fetch_apk "$sec" || return 1
     install_apk "$sec" "$APK_FILE" || return 1
@@ -1016,7 +1420,7 @@ reapply_disabled() {
     REAPPLIED=0
     disabled_now="$(dsh pm list packages -d | sed 's/^package://')"
     for p in $(state_get disabled); do
-        printf '%s\n' "$disabled_now" | grep -qx "$p" || want="$want $p"
+        printf '%s\n' "$disabled_now" | qgrep -x "$p" || want="$want $p"
     done
     [ -n "$want" ] || return 0
     count="$(disable_batch "$want" | grep -c $'\tdisabled$')"
@@ -1127,6 +1531,7 @@ choose_groups() {
     say ""
     while IFS=$'\t' read -r k p; do
         [ "$k" = always ] && continue
+        group_hits_launcher "$k" && continue   # never offer to disable the launcher being kept
         keys+=("$k")
         prompts+=("$p")
     done <<EOF
@@ -1142,11 +1547,65 @@ EOF
     done
 }
 
+# Sets PROCESS_LIMIT and FORCE_GPU: asks when they were not given on the command line.
+choose_performance() {
+    local reply
+    validate_performance
+    if [ "$NONINTERACTIVE" -eq 1 ]; then
+        PROCESS_LIMIT="${PROCESS_LIMIT:-2}"
+        FORCE_GPU="${FORCE_GPU:-on}"
+        return
+    fi
+    [ -z "$PROCESS_LIMIT" ] || [ -z "$FORCE_GPU" ] || return 0
+    banner "STEP 4: Performance"
+    say ""
+    say "  Fire TV sticks have little RAM. Two settings from Android's developer options help:"
+    say "  a background process limit (apps you have left are closed sooner, so the app you are"
+    say "  using keeps the memory) and forced GPU rendering (apps draw their screens on the GPU)."
+    say "  Both are undone by --revert."
+    say ""
+    if [ -z "$PROCESS_LIMIT" ]; then
+        while :; do
+            read -r -p "  Background process limit: 0-4, or s for the Fire OS standard [2]: " reply || reply=""
+            case "$reply" in
+                "")           PROCESS_LIMIT=2; break ;;
+                [0-4])        PROCESS_LIMIT="$reply"; break ;;
+                s|S|standard) PROCESS_LIMIT=standard; break ;;
+                *)            say "  Please answer 0, 1, 2, 3, 4 or s." ;;
+            esac
+        done
+    fi
+    if [ -z "$FORCE_GPU" ]; then
+        if yesno "Force GPU rendering?" y; then FORCE_GPU=on; else FORCE_GPU=off; fi
+    fi
+}
+
 validate_groups() {
     local g
     for g in $(printf '%s' "$1" | tr ',' ' '); do
         group_exists "$g" || die "Unknown group '$g'. Known: $(conf_groups | awk -F'\t' '$1 != "always" { printf "%s ", $1 }')"
     done
+}
+
+# group_hits_launcher <group> -> 0 when the group contains the chosen launcher's own package
+# (only the stock launcher, whose package is in packages.conf, can match).
+group_hits_launcher() {
+    local lp
+    lp="$(lconf "$LAUNCHER_KEY" package)"
+    [ -n "$lp" ] && conf_packages "$1" | grep -x "$lp" >/dev/null
+}
+
+# Removes such groups from CHOSEN_GROUPS (from --disable, a saved state or a prompt) with a warning.
+drop_launcher_groups() {
+    local g kept=""
+    for g in $(csv_items "$CHOSEN_GROUPS"); do
+        if group_hits_launcher "$g"; then
+            warn "Group '$g' would disable $(lconf "$LAUNCHER_KEY" name), the launcher you are keeping; skipped."
+        else
+            kept="$(csv_add "$kept" "$g")"
+        fi
+    done
+    CHOSEN_GROUPS="$kept"
 }
 
 # Sets BLOAT (space-separated) from the always group plus CHOSEN_GROUPS.
@@ -1165,9 +1624,9 @@ classify_bloat() {
     disabled="$(dsh pm list packages -d | sed 's/^package://')"
     PRESENT=""; ALREADY_DISABLED=""; ABSENT=""
     for p in $BLOAT; do
-        if printf '%s\n' "$disabled" | grep -qx "$p"; then
+        if printf '%s\n' "$disabled" | qgrep -x "$p"; then
             ALREADY_DISABLED="$ALREADY_DISABLED $p"
-        elif printf '%s\n' "$all" | grep -qx "$p"; then
+        elif printf '%s\n' "$all" | qgrep -x "$p"; then
             PRESENT="$PRESENT $p"
         else
             ABSENT="$ABSENT $p"
@@ -1188,8 +1647,8 @@ do_status() {
     disabled="$(dsh pm list packages -d | sed 's/^package://')"
     for k in $(lconf_sections); do
         pkg="$(lconf "$k" package)"
-        if dsh pm path "$pkg" | grep -q "package:"; then
-            ok "$(lconf "$k" name): installed$( printf '%s' "$acc" | grep -q "$pkg" && printf ', accessibility service on')$( printf '%s' "$role" | grep -q "$pkg" && printf ', holds HOME role')"
+        if dsh pm path "$pkg" | qgrep "package:"; then
+            ok "$(lconf "$k" name): installed$( printf '%s' "$acc" | qgrep "$pkg" && printf ', accessibility service on')$( printf '%s' "$role" | qgrep "$pkg" && printf ', holds HOME role')"
         else
             warn "$(lconf "$k" name): not installed"
         fi
@@ -1199,10 +1658,13 @@ do_status() {
     say "  Accessibility services:  ${acc:-none}"
     say "  Disabled packages:       $(printf '%s\n' "$disabled" | grep -c .)"
     printf '%s\n' "$disabled" | sed '/^$/d; s/^/      /'
+    say "  Background process limit: $(describe_limit "$(get_process_limit)")"
+    say "  Force GPU rendering:      $(get_force_gpu)"
     say ""
     if [ -f "$STATE_FILE" ]; then
         say "  Saved state ($STATE_FILE):"
         say "      launcher=$(state_get launcher) addons=$(state_get addons) groups=$(state_get groups)"
+        say "      process_limit=$(state_get process_limit) gpu_rendering=$(state_get force_gpu)"
         say "      recorded as disabled by this tool: $(state_get disabled | grep -c .)"
     else
         say "  No saved state for this device (nothing recorded by this tool yet)."
@@ -1236,7 +1698,7 @@ EOF
 
     restore_secure_setting enabled_accessibility_services
     restore_secure_setting enabled_notification_listeners
-    if ! dsh settings get secure enabled_accessibility_services | grep -qv '^null$'; then
+    if ! dsh settings get secure enabled_accessibility_services | qgrep -v '^null$'; then
         dsh settings put secure accessibility_enabled 0 >/dev/null
     fi
     ok "Accessibility and notification listener settings restored"
@@ -1245,13 +1707,15 @@ EOF
         pkgs="$(state_get installed | tr '\n' ' ')"
     else
         pkgs=""
-        for k in $(lconf_sections); do pkgs="$pkgs $(lconf "$k" package)"; done
+        for k in $(lconf_sections); do
+            [ "$(lconf "$k" source)" = none ] || pkgs="$pkgs $(lconf "$k" package)"
+        done
     fi
     for pkg in $pkgs; do
-        dsh pm path "$pkg" | grep -q "package:" || continue
+        dsh pm path "$pkg" | qgrep "package:" || continue
         dsh appops set "$pkg" SYSTEM_ALERT_WINDOW default >/dev/null
         dsh cmd role remove-role-holder android.app.role.HOME "$pkg" >/dev/null
-        if dsh pm uninstall "$pkg" | grep -q Success; then
+        if dsh pm uninstall "$pkg" | qgrep Success; then
             ok "Uninstalled: $pkg"
         else
             warn "Could not uninstall $pkg"
@@ -1259,6 +1723,7 @@ EOF
     done
     dsh cmd role add-role-holder android.app.role.HOME "$stock" >/dev/null
     ok "HOME role returned to the Amazon launcher"
+    restore_performance
 
     rm -f "$STATE_FILE"
     banner "REVERT COMPLETE"
@@ -1274,6 +1739,8 @@ do_install() {
     choose_addons
     choose_groups
     validate_groups "$CHOSEN_GROUPS"
+    drop_launcher_groups
+    choose_performance
     build_bloat_list
     classify_bloat
 
@@ -1282,6 +1749,8 @@ do_install() {
         say "  Launcher:        $(lconf "$LAUNCHER_KEY" name)"
         say "  Add-ons:         ${CHOSEN_ADDONS:-none}"
         say "  Optional groups: ${CHOSEN_GROUPS:-none}"
+        say "  Process limit:   $(describe_limit "$PROCESS_LIMIT") (now: $(describe_limit "$(get_process_limit)"))"
+        say "  GPU rendering:   $FORCE_GPU (now: $(get_force_gpu))"
         say ""
         say "  Would disable ($(count_words "$PRESENT")):"
         for sec in $PRESENT; do say "      $sec"; done
@@ -1301,6 +1770,8 @@ do_install() {
     for sec in $(csv_items "$CHOSEN_ADDONS"); do
         setup_app "$sec" || die "$(lconf "$sec" name) setup failed."
     done
+
+    apply_performance
 
     if [ -n "$(printf '%s' "$PRESENT" | tr -d ' ')" ]; then
         run_disable_passes "$PRESENT"
@@ -1325,6 +1796,7 @@ do_install() {
     verify_app "$LAUNCHER_KEY"
     for sec in $(csv_items "$CHOSEN_ADDONS"); do verify_app "$sec"; done
     say "  [OK] $(dsh pm list packages -d | grep -c 'package:') packages are disabled on the device"
+    verify_performance
     # shellcheck disable=SC2046  # add-on keys are single words
     verify_boot "$LAUNCHER_KEY" $(csv_items "$CHOSEN_ADDONS")
 
@@ -1337,6 +1809,8 @@ do_install() {
     banner "ALL DONE"
     say "  Launcher:            $(lconf "$LAUNCHER_KEY" name)"
     say "  Add-ons:             ${CHOSEN_ADDONS:-none}"
+    say "  Process limit:       $(describe_limit "${PROCESS_LIMIT:-standard}")"
+    say "  GPU rendering:       ${FORCE_GPU:-unchanged}"
     say "  Disabled this run:   $TOTAL_DISABLED (protected by Amazon: $TOTAL_PROTECTED)"
     say "  RAM freed:           $((MEM_AVAIL - before_avail)) MB"
     say ""
@@ -1349,15 +1823,15 @@ verify_app() {
     local sec="$1" pkg name p
     pkg="$(lconf "$sec" package)"
     name="$(lconf "$sec" name)"
-    if dsh pm path "$pkg" | grep -q "package:"; then ok "$name is installed"; else err "$name is NOT installed"; fi
+    if dsh pm path "$pkg" | qgrep "package:"; then ok "$name is installed"; else err "$name is NOT installed"; fi
     for p in $(lconf "$sec" grant); do
-        if dsh dumpsys package "$pkg" | grep -q "$p: granted=true"; then
+        if dsh dumpsys package "$pkg" | qgrep "$p: granted=true"; then
             ok "$name has ${p##*.}"
             continue
         fi
         # Grants made shortly before a reboot can be lost; grant again and re-check.
         dsh pm grant "$pkg" "$p" >/dev/null
-        if dsh dumpsys package "$pkg" | grep -q "$p: granted=true"; then
+        if dsh dumpsys package "$pkg" | qgrep "$p: granted=true"; then
             ok "$name has ${p##*.} (granted again; the first grant did not persist)"
         elif [ "$p" = android.permission.WRITE_SECURE_SETTINGS ] && [ -n "$(lconf "$sec" accessibility)" ]; then
             warn "${p##*.} cannot be granted on this firmware."
@@ -1368,7 +1842,7 @@ verify_app() {
         fi
     done
     if [ -n "$(lconf "$sec" accessibility)" ]; then
-        if dsh settings get secure enabled_accessibility_services | grep -q "$pkg"; then
+        if dsh settings get secure enabled_accessibility_services | qgrep "$pkg"; then
             ok "$name accessibility service is active"
         else
             err "$name accessibility service is NOT active"
@@ -1394,6 +1868,8 @@ do_reapply() {
         if [ -z "$DISABLE_GROUPS" ]; then choose_groups; else CHOSEN_GROUPS="$DISABLE_GROUPS"; fi
     fi
     validate_groups "$CHOSEN_GROUPS"
+    LAUNCHER_KEY="${LAUNCHER_KEY:-$(state_get launcher)}"
+    drop_launcher_groups
     state_set groups "$CHOSEN_GROUPS"
     build_bloat_list
     classify_bloat
@@ -1410,14 +1886,19 @@ do_reapply() {
     fi
     local lk sec
     lk="$(state_get launcher)"
-    if [ -n "$lk" ] && dsh pm path "$(lconf "$lk" package)" | grep -q "package:"; then
+    if [ -n "$lk" ] && [ "$(lconf "$lk" source)" != none ] && dsh pm path "$(lconf "$lk" package)" | qgrep "package:"; then
         configure_app "$lk" >/dev/null 2>&1 && ok "$(lconf "$lk" name) settings re-applied"
     fi
     for sec in $(csv_items "$(state_get addons)"); do
-        if dsh pm path "$(lconf "$sec" package)" | grep -q "package:"; then
+        if dsh pm path "$(lconf "$sec" package)" | qgrep "package:"; then
             configure_app "$sec" >/dev/null 2>&1 && ok "$(lconf "$sec" name) settings re-applied"
         fi
     done
+    # Performance tweaks: the saved values unless overridden on the command line.
+    validate_performance
+    PROCESS_LIMIT="${PROCESS_LIMIT:-$(state_get process_limit)}"
+    FORCE_GPU="${FORCE_GPU:-$(state_get force_gpu)}"
+    [ -z "$PROCESS_LIMIT$FORCE_GPU" ] || apply_performance "Re-applying performance tweaks"
     banner "RE-APPLY COMPLETE"
     say "  Disabled this run: $TOTAL_DISABLED (protected: $TOTAL_PROTECTED)"
 }
@@ -1436,6 +1917,7 @@ do_test_boot() {
     fi
     verify_app "$lk"
     for sec in $(csv_items "$(state_get addons)"); do verify_app "$sec"; done
+    verify_performance
     # shellcheck disable=SC2046  # add-on keys are single words
     verify_boot "$lk" $(csv_items "$(state_get addons)")
 }
@@ -1456,6 +1938,7 @@ main() {
 
     [ -f "$PACKAGES_CONF" ]  || die "Missing $PACKAGES_CONF"
     [ -f "$LAUNCHERS_CONF" ] || die "Missing $LAUNCHERS_CONF"
+    validate_performance   # reject bad --process-limit / --gpu-rendering values before connecting
     find_adb || die "ADB is not available. Install Android platform-tools or put adb in $PLATFORM_DIR/adb/."
     ok "ADB: $ADB"
 

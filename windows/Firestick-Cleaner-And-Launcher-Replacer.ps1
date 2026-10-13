@@ -60,7 +60,7 @@ Modes (default: full install)
 
 Options
   --ip <ip[:port]>    Fire TV address (skips the prompt)
-  --launcher <key>    projectivy | at4k | couchy   (default: projectivy)
+  --launcher <key>    projectivy | at4k | couchy | stock   (default: projectivy)
   --with <a,b,..>     Add-ons: homeonfire, youtubetv, googleapp, smarttube (see common\launchers.conf)
   --without <a,b,..>  Add-ons to skip
   --home-on-fire      Same as --with homeonfire      --no-home-on-fire: --without homeonfire
@@ -735,7 +735,20 @@ function Show-Notes($sec) {
 }
 
 function Install-App($sec) {
-    Banner "Installing $(Get-Conf1 $sec 'name')"
+    $name = Get-Conf1 $sec 'name'
+    if ((Get-Conf1 $sec 'source') -eq 'none') {
+        # The stock launcher: nothing to install; hand the HOME role back if another launcher holds it.
+        $pkg = Get-Conf1 $sec 'package'
+        Banner "Keeping $name"
+        if ($pkg -and (Get-HomeRoleHolder) -ne $pkg) {
+            Invoke-Dsh @('cmd', 'role', 'add-role-holder', 'android.app.role.HOME', $pkg) | Out-Null
+            Ok "HOME role handed back to $name"
+            Info 'Launchers installed by an earlier run stay installed; --revert removes them.'
+        }
+        Ok "$name stays as it is; nothing to install"
+        return $true
+    }
+    Banner "Installing $name"
     $apk = Get-Apk $sec
     if (-not $apk) { return $false }
     if (-not (Install-Apk $sec $apk)) { return $false }
@@ -890,6 +903,7 @@ function Select-Groups {
     $chosen = @()
     foreach ($g in (Get-Groups)) {
         if ($g.Key -eq 'always') { continue }
+        if (Test-GroupHitsLauncher $g.Key) { continue }   # never offer to disable the launcher being kept
         if (Ask-YesNo $g.Prompt 'n') { $chosen += $g.Key }
     }
     return ($chosen -join ',')
@@ -901,6 +915,25 @@ function Test-Groups($csv) {
             Die "Unknown group '$g'. Known: $((Get-Groups | Where-Object { $_.Key -ne 'always' } | ForEach-Object { $_.Key }) -join ' ')"
         }
     }
+}
+
+# True when the group contains the chosen launcher's own package (only the stock launcher can match).
+function Test-GroupHitsLauncher($key) {
+    if (-not $script:LauncherKey) { return $false }
+    $lp = Get-Conf1 $script:LauncherKey 'package'
+    return [bool]($lp -and ((Get-GroupPackages $key) -contains $lp))
+}
+
+# Drops such groups (from --disable, a saved state or a prompt) with a warning; returns the csv.
+function Remove-LauncherGroups($csv) {
+    $kept = @()
+    foreach ($g in ($csv -split ',')) {
+        if (-not $g) { continue }
+        if (Test-GroupHitsLauncher $g) {
+            Warn "Group '$g' would disable $(Get-Conf1 $script:LauncherKey 'name'), the launcher you are keeping; skipped."
+        } else { $kept += $g }
+    }
+    return ($kept -join ',')
 }
 
 function Get-BloatList($csv) {
@@ -979,7 +1012,7 @@ function Invoke-Revert {
     Ok 'Accessibility and notification listener settings restored'
 
     if (Test-Path $StateFile) { $apps = @(Get-State 'installed') }
-    else { $apps = @(Get-Sections | ForEach-Object { Get-Conf1 $_ 'package' }) }
+    else { $apps = @(Get-Sections | Where-Object { (Get-Conf1 $_ 'source') -ne 'none' } | ForEach-Object { Get-Conf1 $_ 'package' }) }
     foreach ($pkg in $apps) {
         if (-not (Test-Installed $pkg)) { continue }
         Invoke-Dsh @('appops', 'set', $pkg, 'SYSTEM_ALERT_WINDOW', 'default') | Out-Null
@@ -1028,6 +1061,7 @@ function Invoke-Install {
     Select-Addons
     $groups = Select-Groups
     Test-Groups $groups
+    $groups = Remove-LauncherGroups $groups
     $bloat = Get-BloatList $groups
     $split = Split-Bloat $bloat
 
@@ -1099,6 +1133,8 @@ function Invoke-Reapply {
         $groups = if ($DisableGroups) { $DisableGroups } else { Select-Groups }
     }
     Test-Groups $groups
+    if (-not $script:LauncherKey) { $script:LauncherKey = Get-State1 'launcher' }
+    $groups = Remove-LauncherGroups $groups
     Set-State 'groups' $groups
     $split = Split-Bloat (Get-BloatList $groups)
     if ($split.Present.Count -gt 0) {
@@ -1113,7 +1149,7 @@ function Invoke-Reapply {
         Ok 'Everything is already disabled; nothing to do.'
     }
     $lk = Get-State1 'launcher'
-    if ($lk -and (Test-Installed (Get-Conf1 $lk 'package'))) {
+    if ($lk -and (Get-Conf1 $lk 'source') -ne 'none' -and (Test-Installed (Get-Conf1 $lk 'package'))) {
         if (Set-AppConfig $lk) { Ok "$(Get-Conf1 $lk 'name') settings re-applied" }
     }
     foreach ($a in @((Get-State1 'addons') -split ',' | Where-Object { $_ })) {

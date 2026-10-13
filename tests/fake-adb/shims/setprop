@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+DEV="$FAKE_DEV"
+grep -v "^$1=" "$DEV/props" > "$DEV/props.tmp"; mv "$DEV/props.tmp" "$DEV/props"; echo "$1=$2" >> "$DEV/props"

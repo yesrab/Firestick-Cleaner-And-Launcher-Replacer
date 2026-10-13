@@ -7,13 +7,14 @@ Replace the ad-filled Amazon Fire TV home screen with a launcher of your choice 
 ## What it does
 
 1. Connects to your Fire TV over ADB (Wi-Fi), waits for you to accept the prompt on the TV, and reads its Fire OS version, Android API level and CPU type
-2. Installs the launcher you pick: **Projectivy**, **AT4K** or **Couchy**
+2. Installs the launcher you pick: **Projectivy**, **AT4K** or **Couchy**, or keeps the **Amazon launcher** if you only want the clean-up
 3. Optionally installs add-ons: **Home on Fire** (makes the Home button open your launcher), **YouTube for Android TV** or **SmartTube** (in place of Amazon's YouTube wrapper) and the **Google app for Android TV**, each in the build that matches your device
 4. Asks which optional Amazon apps you want to keep (Music, Photos, Appstore, Prime Video services...)
-5. Disables tracking, telemetry, ads and background bloat, plus your optional choices
-6. Reboots, verifies, and re-disables anything Amazon re-enabled during the reboot
-7. Shows a before/after RAM comparison
-8. Records everything it changed, so `--revert` undoes exactly that and nothing else
+5. Applies two performance tweaks from Android's developer options: a background process limit (default 2) and forced GPU rendering
+6. Disables tracking, telemetry, ads and background bloat, plus your optional choices
+7. Reboots, verifies, and re-disables anything Amazon re-enabled during the reboot
+8. Shows a before/after RAM comparison
+9. Records everything it changed, so `--revert` undoes exactly that and nothing else
 
 ## Launchers
 
@@ -22,6 +23,7 @@ Replace the ad-filled Amazon Fire TV home screen with a launcher of your choice 
 | [Projectivy Launcher](https://github.com/spocky/miproja1) (default) | Its own accessibility service | Downloaded automatically from GitHub, SHA-256 verified | Feature-rich. After install, enable **Settings > General > Override current launcher** in Projectivy. |
 | [AT4K Launcher](https://at4klauncher.com/) | Its own accessibility service | **Not bundled.** It is a paid app sold on Google Play; you must supply the APK and save it next to the script as `AT4K*.apk` or `base.apk` | Lightweight. |
 | [Couchy Launcher](https://github.com/conreo/couchy-launcher) | None. Pair it with Home on Fire | Downloaded automatically from GitHub, SHA-256 verified | Minimal, open source, no Google services needed. |
+| Amazon launcher (keep stock) | Unchanged | Nothing to install | Pick this (`--launcher stock`) to leave the home screen alone and only debloat, add add-ons and apply the performance tweaks. The optional group that disables the stock launcher is skipped automatically, and the HOME role is handed back to Amazon's launcher if another one holds it. |
 
 ## Add-ons
 
@@ -41,11 +43,11 @@ Google does not publish this APK, and APKMirror, the usual mirror, does not allo
 
 1. It reads the Fire TV's Android API level and CPU type over adb (Fire OS 7 is API 28, Fire OS 8 is API 30; sticks are `armeabi-v7a`, newer models also `arm64-v8a`).
 2. It asks APKMirror's metadata API, the same one the open-source APKUpdater app uses, for the newest release and picks the variant whose minimum API and CPU fit your device.
-3. It opens exactly that download page in your browser. You click **DOWNLOAD APK**.
-4. It watches your Downloads folder (and the script folder), picks the file up, checks it is a real APK, and compares its signing certificate with the one APKMirror recorded for that release when the APK carries a v1 signature. Android verifies the signature again on install.
+3. It opens exactly that download page in your browser. You click **DOWNLOAD APK** (or **DOWNLOAD APK BUNDLE**: newer releases come as an `.apkm` bundle of base APK plus split APKs, which is fine).
+4. It watches your Downloads folder (and the script folder), picks the file up, checks it is a real APK, and compares its signing certificate with the one APKMirror recorded for that release when the APK carries a v1 signature. An `.apkm` bundle is unpacked first: base.apk and the split APKs that fit your Fire TV's CPU are kept and installed in one `adb install-multiple` session. Android verifies the signature again on install. A file you saved before starting the run is accepted when it is the build APKMirror reported, even if you renamed it (bundles are recognised by the `info.json` inside). Press **Enter** while it is watching to see which files it can see and why each was skipped.
 5. After installing it confirms the installed build number matches.
 
-The file is cached under `downloads/`, so later runs and `--reapply` need no click. In `--non-interactive` mode the click is impossible, so place a `com.google.android.youtube.tv_*.apk` next to the entry point beforehand. If your browser saves downloads somewhere unusual, set `FSC_DOWNLOADS_DIR`.
+The file is cached under `downloads/`, so later runs and `--reapply` need no click. In `--non-interactive` mode the click is impossible, so place a `com.google.android.youtube.tv_*.apk` or `.apkm` next to the entry point beforehand. If your browser saves downloads somewhere unusual, set `FSC_DOWNLOADS_DIR`.
 
 Sign-in uses the on-screen code at youtube.com/activate. On some Fire OS versions sign-in needs Google Play Services, which Fire OS does not have, and will not work; playback works signed out. If you want an account without Google services, use SmartTube instead.
 
@@ -60,6 +62,15 @@ Google's Assistant and voice-search app for Android TV (`com.google.android.katn
 ### Why not microG?
 
 microG reimplements Google Play Services, but Google's own apps (YouTube, the Google app) only accept it when the system allows signature spoofing, which needs root or a custom ROM. Fire TV offers neither, so microG cannot provide sign-in for the official YouTube app here. SmartTube does not need any of this.
+
+## Performance tweaks
+
+Fire TV sticks have little RAM, so after the optional groups the tool asks about two settings that live under Android's hidden developer options (Fire OS has no menu for them):
+
+- **Background process limit** (`--process-limit 0-4|standard`, default 2): how many apps Android keeps alive after you leave them. With 2, the app you are using keeps the memory instead of sharing it with everything you opened earlier; apps you return to may start cold. `standard` leaves Fire OS's own limit (8 on current Fire OS 8 builds). Android's developer-options toggle for this forgets its value at every reboot; the tool sets the value underneath it instead (`device_config activity_manager max_cached_processes` on Fire OS 8, the `activity_manager_constants` setting on Fire OS 6/7), which survives reboots and takes effect at once.
+- **Force GPU rendering** (`--gpu-rendering on|off`, default on): sets `persist.sys.ui.hw`, so every app window is drawn by the GPU, including older apps that still default to CPU drawing. Firmware that protects the property gets a warning and nothing else changes.
+
+With `-y` the defaults apply unless you pass the flags. Both values are recorded, re-checked by `--test-boot`, re-applied by `--reapply`, and put back to their previous values by `--revert`.
 
 ## Platforms
 
@@ -122,10 +133,13 @@ Modes (default: full install)
 
 Options
   --ip <ip[:port]>    Fire TV address (skips the prompt; the last used address is remembered)
-  --launcher <key>    projectivy | at4k | couchy   (default: projectivy)
+  --launcher <key>    projectivy | at4k | couchy | stock   (default: projectivy; stock keeps Amazon's home screen)
   --with <a,b,..>     Add-ons to install: homeonfire, youtubetv, smarttube, googleapp
   --without <a,b,..>  Add-ons to skip (--home-on-fire / --no-home-on-fire are shorthands for homeonfire)
   --disable <a,b,..>  Optional groups to disable, comma-separated (keys from packages.conf)
+  --process-limit <n> Background process limit: 0-4 (default 2) or "standard" to leave Fire OS's own
+  --gpu-rendering <on|off>
+                      Force GPU rendering for every app (default on)
   -y, --non-interactive
                       Never prompt; requires --ip
 ```
@@ -149,7 +163,7 @@ Updates re-enable packages and sometimes wipe the accessibility settings. Run wi
 
 ### Reverting
 
-`--revert` reads the state file written for the device (`firestick_cleanup_<ip>.state` next to the entry point) and undoes exactly what was recorded: re-enables those packages (including ones an add-on replaced, such as Amazon's YouTube), restores the previous accessibility and notification-listener values, removes the HOME role and overlay permission from the launcher, uninstalls the launcher and the add-ons, and hands the HOME role back to the Amazon launcher. If no state file exists it warns and offers to re-enable every disabled package instead.
+`--revert` reads the state file written for the device (`firestick_cleanup_<ip>.state` next to the entry point) and undoes exactly what was recorded: re-enables those packages (including ones an add-on replaced, such as Amazon's YouTube), restores the previous accessibility and notification-listener values, removes the HOME role and overlay permission from the launcher, uninstalls the launcher and the add-ons, hands the HOME role back to the Amazon launcher, and puts the background process limit and GPU rendering back to their previous values. If no state file exists it warns and offers to re-enable every disabled package instead.
 
 ## What gets disabled
 

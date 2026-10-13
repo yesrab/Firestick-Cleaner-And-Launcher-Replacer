@@ -8,6 +8,7 @@ platform-tools.zip
 
 # APKs are downloaded at run time or supplied by the user; never commit them
 *.apk
+*.apkm
 
 # .NET / WinForms build output
 **/bin/

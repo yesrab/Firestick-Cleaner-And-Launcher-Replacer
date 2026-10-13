@@ -138,6 +138,14 @@ namespace FirestickCleanup
                 var addon = (AppDef)kv.Value.Tag;
                 kv.Value.Checked = addon.DefaultOn || needs.Contains(kv.Key);
             }
+            // Never offer to disable the launcher being kept (the stock launcher's package is in packages.conf).
+            foreach (var kv in groupBoxes)
+            {
+                var g = (GroupDef)kv.Value.Tag;
+                bool hits = !string.IsNullOrEmpty(app.Package) && g.Packages.Contains(app.Package);
+                if (hits) kv.Value.Checked = false;
+                kv.Value.Enabled = !hits;
+            }
         }
 
         private Choices ReadChoices()
@@ -251,6 +259,7 @@ namespace FirestickCleanup
             state.Set("version", Version);
             state.Set("launcher", c.Launcher.Key);
             state.Set("addons", string.Join(",", c.Addons));
+            c.Groups = DropLauncherGroups(c.Groups, c.Launcher);
             state.Set("groups", string.Join(",", c.Groups));
 
             SetProgress(15, "Installing " + c.Launcher.Name + "...");
@@ -310,6 +319,7 @@ namespace FirestickCleanup
             var groupsToUse = state.Exists && c.Groups.Count == 0
                 ? state.Get("groups").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).ToList()
                 : c.Groups;
+            groupsToUse = DropLauncherGroups(groupsToUse, apps.FirstOrDefault(a => a.Key == state.Get("launcher")));
             Log("  [..] Groups: " + (groupsToUse.Count > 0 ? string.Join(",", groupsToUse) : "none"));
             state.Set("groups", string.Join(",", groupsToUse));
 
@@ -331,7 +341,7 @@ namespace FirestickCleanup
 
             SetProgress(85, "Re-applying launcher settings...");
             var launcher = apps.FirstOrDefault(a => a.Key == state.Get("launcher"));
-            if (launcher != null && await IsInstalledAsync(launcher.Package))
+            if (launcher != null && launcher.Source != "none" && await IsInstalledAsync(launcher.Package))
             {
                 if (await ConfigureAppAsync(launcher)) Log($"  [OK] {launcher.Name} settings re-applied");
             }
@@ -413,7 +423,7 @@ namespace FirestickCleanup
             Log("  [OK] Accessibility and notification listener settings restored");
 
             SetProgress(75, "Removing apps...");
-            var toRemove = state.Exists ? state.GetAll("installed") : apps.Select(a => a.Package).ToList();
+            var toRemove = state.Exists ? state.GetAll("installed") : apps.Where(a => a.Source != "none").Select(a => a.Package).ToList();
             foreach (var pkg in toRemove)
             {
                 if (!await IsInstalledAsync(pkg)) continue;
@@ -1033,6 +1043,19 @@ namespace FirestickCleanup
         private async Task<bool> SetupAppAsync(AppDef app)
         {
             Log("");
+            if (app.Source == "none")
+            {
+                // The stock launcher: nothing to install; hand the HOME role back if another launcher holds it.
+                Log("=== Keeping " + app.Name + " ===");
+                if (!string.IsNullOrEmpty(app.Package) && await HomeRoleHolderAsync() != app.Package)
+                {
+                    await DshAsync("cmd", "role", "add-role-holder", "android.app.role.HOME", app.Package);
+                    Log($"  [OK] HOME role handed back to {app.Name}");
+                    Log("  [..] Launchers installed by an earlier run stay installed; Revert removes them.");
+                }
+                Log($"  [OK] {app.Name} stays as it is; nothing to install");
+                return true;
+            }
             Log("=== Installing " + app.Name + " ===");
             string apk = await FetchApkAsync(app);
             if (apk == null) return false;
@@ -1077,6 +1100,21 @@ namespace FirestickCleanup
         // ------------------------------------------------------------
         // Package disabling
         // ------------------------------------------------------------
+        /// <summary>Drops groups that would disable the chosen launcher's own package (only the stock launcher can match).</summary>
+        private List<string> DropLauncherGroups(IEnumerable<string> groupKeys, AppDef launcher)
+        {
+            var kept = new List<string>();
+            foreach (var key in groupKeys)
+            {
+                var g = groups.FirstOrDefault(x => x.Key == key);
+                if (launcher != null && g != null && !string.IsNullOrEmpty(launcher.Package) && g.Packages.Contains(launcher.Package))
+                    Log($"  [--] Group '{key}' would disable {launcher.Name}, the launcher you are keeping; skipped.");
+                else
+                    kept.Add(key);
+            }
+            return kept;
+        }
+
         private List<string> BuildBloatList(IEnumerable<string> groupKeys)
         {
             var list = new List<string>();
