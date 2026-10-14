@@ -198,7 +198,6 @@ Everything below lives in `common/packages.conf`. The `[always]` group is disabl
 | `com.amazon.device.rdmapplication` | **Remote device management** |
 | `com.amazon.wifilocker` | **WiFi Locker**: shares your Wi-Fi password with Amazon |
 | `com.amazon.spiderpork` | **SpiderPork**: background analytics |
-| `com.amazon.firebat` | **FireBat**: power analytics |
 | `com.amazon.ssm`, `com.amazon.ssmsys` | **Systems manager** agent and service |
 | `com.amazon.tv.easyupgrade` | **Easy Upgrade**: "buy a newer Fire TV" prompts |
 | `com.amazon.dpcclient` | **Device policy controller** |
@@ -211,6 +210,7 @@ Everything below lives in `common/packages.conf`. The `[always]` group is disabl
 | Key | Prompt | Packages |
 |-----|--------|----------|
 | `video` | Amazon Video services. **Answer N if you use Prime Video, Freevee or MiniTV**, or playback breaks | `com.amazon.avls.experience`, `com.amazon.prism.android.service`, `com.amazon.dp.logger`, `com.amazon.livedeviceservice`, `com.amazon.rtcsessioncontroller`, `com.amazon.client.metrics.api` |
+| `primevideo` | Prime Video itself. **Answer N if you watch Prime Video.** `com.amazon.firebat` is Amazon's internal name for the Prime Video app, not a telemetry service; once it is disabled the stock launcher drops its tile while third-party launchers may keep showing a cached icon | `com.amazon.firebat` |
 | `appstore` | Amazon Appstore | `com.amazon.venezia` |
 | `photos` | Amazon Photos | `com.amazon.bueller.photos` |
 | `music` | Amazon Music | `com.amazon.bueller.music` |

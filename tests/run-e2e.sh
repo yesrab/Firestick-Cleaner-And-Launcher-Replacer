@@ -84,9 +84,9 @@ assert_contains "assisted download refused without a human" "$out" "APKMirror do
 echo "== install (couchy + home on fire + youtube tv via assisted download + smarttube) =="
 # Interactive run so the browser-assisted download is allowed; every prompt gets an explicit answer.
 # answers: IP, launcher 3 (couchy), add-ons: homeonfire y, youtubetv y, googleapp n, smarttube y,
-#          groups: video y, 11x Enter (keep), updates y, stocklauncher y,
+#          groups: video y, 12x Enter (keep: primevideo .. whisperplay), updates y, stocklauncher y,
 #          performance: Enter (limit 2), Enter (GPU on), then Enter for each notes pause and to exit
-out="$(printf '10.0.0.9\n3\ny\ny\nn\ny\ny\n\n\n\n\n\n\n\n\n\n\n\ny\ny\n\n\n\n\n\n\n\n\n' | run)"
+out="$(printf '10.0.0.9\n3\ny\ny\nn\ny\ny\n\n\n\n\n\n\n\n\n\n\n\n\ny\ny\n\n\n\n\n\n\n\n\n' | run)"
 assert_contains "launcher installed" "$out" "Couchy Launcher holds the HOME role"
 assert_contains "home on fire configured" "$out" "Home on Fire accessibility service is active"
 assert_contains "home on fire grant verified" "$out" "Home on Fire has WRITE_SECURE_SETTINGS"
@@ -141,7 +141,9 @@ assert_contains "accessibility restored" "$(cat "$FAKE_DEV/settings")" "io.githu
 assert_contains "process limit re-applied after the update" "$(cat "$FAKE_DEV/settings")" "activity_manager_constants=max_cached_processes=2"
 
 echo "== interactive install (projectivy, answers piped) =="
-out="$(printf '\n1\nn\nn\nn\nn\n\ny\n\ny\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | run)"
+# answers: IP (Enter = last IP), launcher 1, 4x n (add-ons), groups: video keep, primevideo keep, appstore y,
+#          photos keep, music y, then Enter for the remaining groups, performance, notes pause and exit
+out="$(printf '\n1\nn\nn\nn\nn\n\n\ny\n\ny\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | run)"
 assert_contains "menu picks projectivy" "$out" "Launcher: Projectivy Launcher"
 assert_contains "projectivy accessibility appended" "$(cat "$FAKE_DEV/settings")" "HijackService:com.spocky.projengmenu/com.spocky.projengmenu.services.ProjectivyAccessibilityService"
 assert_contains "optional groups saved" "$(cat "$PLAT/firestick_cleanup_10.0.0.9.state")" "groups=appstore,music"
@@ -164,9 +166,10 @@ echo "== a renamed bundle saved before the run is accepted by the watcher =="
 # the run and no longer carries APKMirror's name: it is recognised by the info.json inside.
 rm -rf "$PLAT/downloads"; rm -f "$FSC_DOWNLOADS_DIR"/*
 cp "$WORK/fake-youtube.apkm" "$FSC_DOWNLOADS_DIR/youtube-tv.apkm"; touch -t 202001010000 "$FSC_DOWNLOADS_DIR/youtube-tv.apkm"
+# shellcheck disable=SC2016  # $1 belongs to the generated stub, not to this shell
 printf '#!/usr/bin/env bash\necho "$1" > "%s/opened-url"\n' "$WORK" > "$WORK/no-browser.sh"; chmod +x "$WORK/no-browser.sh"
 export FSC_BROWSER="$WORK/no-browser.sh"
-out="$(printf '10.0.0.9\n3\ny\ny\nn\nn\ny\n\n\n\n\n\n\n\n\n\n\n\ny\ny\n\n\n\n\n\n\n\n\n' | run)"
+out="$(printf '10.0.0.9\n3\ny\ny\nn\nn\ny\n\n\n\n\n\n\n\n\n\n\n\n\ny\ny\n\n\n\n\n\n\n\n\n' | run)"
 assert_contains "renamed bundle picked up and cached under a recognisable name" "$out" "Got com.google.android.youtube.tv_apkmirror-727300320.apkm"
 assert_contains "renamed bundle unpacked" "$out" "Unpacked: base.apk + 1 split APK(s)"
 assert_contains "build read from the bundle's info.json" "$out" "Installed build 727300320"
